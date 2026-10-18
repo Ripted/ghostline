@@ -1,0 +1,45 @@
+appId: com.narrowroutefinder.app
+productName: Narrow Route Finder
+copyright: Copyright © 2026
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - out/**/*
+# The worker bundle and its shared chunk must be real files on disk
+# (worker_threads can't read inside an asar), and the physics engine is loaded
+# from raw bytes, so both are kept outside the asar archive.
+asarUnpack:
+  - out/main/worker.js
+  - out/main/chunks/**
+# The physics engine is loaded from raw bytes by the main process; ship it as
+# an extra resource so the packaged app can read it with fs.readFileSync.
+extraResources:
+  - from: resources/physics
+    to: physics
+    filter:
+      - rust.js
+      - rust_bg.wasm
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  executableName: NarrowRouteFinder
+
+nsis:
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Narrow Route Finder
+  deleteAppDataOnUninstall: false
+
+portable:
+  artifactName: ${productName}-${version}-portable-${arch}.${ext}
+
+npmRebuild: false
