@@ -6,7 +6,13 @@
  * request gap and exponential backoff on failures, exactly like the site's
  * `na-proxy.ts`.
  */
-import type { LevelDetailsEnvelope, RawLevelData } from "../../shared/types.ts";
+import type {
+  LeaderboardEntry,
+  LevelDetailsEnvelope,
+  PublishedLevel,
+  RawLevelData,
+  RunReplayPayload,
+} from "../../shared/types.ts";
 
 const API_BASE = "https://api.narrowarrow.xyz";
 
@@ -87,6 +93,118 @@ export async function fetchLevelData(levelId: string): Promise<RawLevelData> {
     throw new Error(`Level ${levelId} has no geometry (upstream response was empty).`);
   }
   return data;
+}
+
+/** Max rows upstream returns per leaderboard request. */
+const MAX_LEADERBOARD_LIMIT = 150;
+const ARROWS = ["Narrow Arrow", "Speedy Arrow", "Energy Arrow"];
+const BOARD_TTL_MS = 150 * 1000;
+const PUBLISHED_TTL_MS = 3 * 60 * 1000;
+const RUN_TTL_MS = 15 * 60 * 1000;
+
+function asList<T>(payload: unknown): T[] {
+  return Array.isArray(payload) ? (payload as T[]) : [];
+}
+
+/** Tiny TTL cache so leaderboard/published/replay requests stay under limits. */
+const cacheStore = new Map<string, { data: unknown; expiresAt: number }>();
+const inflight = new Map<string, Promise<unknown>>();
+
+async function cached<T>(key: string, ttlMs: number, fetch: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const hit = cacheStore.get(key);
+  if (hit && hit.expiresAt > now) return hit.data as T;
+  const request =
+    inflight.get(key) ??
+    (inflight.set(key, fetch().finally(() => inflight.delete(key))), inflight.get(key)!);
+  try {
+    const data = await request;
+    cacheStore.set(key, { data, expiresAt: now + ttlMs });
+    return data as T;
+  } catch (error) {
+    // Serve stale when throttled.
+    if (hit) return hit.data as T;
+    throw error;
+  }
+}
+
+/**
+ * Leaderboard for a level. When `deep` is true, merges the boards for all three
+ * arrows (each capped at 150 rows upstream, ignoring offsets) so players far
+ * outside the global top 150 surface too.
+ */
+export async function fetchLeaderboard(
+  levelId: string,
+  options: { deep?: boolean; arrowFilter?: string } = {},
+): Promise<LeaderboardEntry[]> {
+  const base = `${API_BASE}/leaderboard?levelId=${encodeURIComponent(levelId)}&limit=${MAX_LEADERBOARD_LIMIT}`;
+  if (options.arrowFilter) {
+    const url = `${base}&arrowFilter=${encodeURIComponent(options.arrowFilter)}`;
+    return asList<LeaderboardEntry>(
+      await cached(`${url}|${levelId}|${options.arrowFilter}`, BOARD_TTL_MS, () =>
+        fetchWithRetry(url),
+      ),
+    );
+  }
+  if (!options.deep) {
+    const url = base;
+    return asList<LeaderboardEntry>(
+      await cached(`${url}|${levelId}|all`, BOARD_TTL_MS, () => fetchWithRetry(url)),
+    );
+  }
+  const boards = await Promise.all(
+    ARROWS.map((arrow) =>
+      cached(`${base}&arrowFilter=${encodeURIComponent(arrow)}|${levelId}|${arrow}`, BOARD_TTL_MS, () =>
+        fetchWithRetry(`${base}&arrowFilter=${encodeURIComponent(arrow)}`).then((p) =>
+          asList<LeaderboardEntry>(p),
+        ),
+      ).catch(() => [] as LeaderboardEntry[]),
+    ),
+  );
+  if (boards.every((b) => b.length === 0)) {
+    const url = base;
+    return asList<LeaderboardEntry>(
+      await cached(`${url}|${levelId}|all`, BOARD_TTL_MS, () => fetchWithRetry(url)),
+    );
+  }
+  const merged = new Map<string, LeaderboardEntry>();
+  for (const board of boards) {
+    for (const entry of board) {
+      const key = String(entry.run_id ?? `${entry.username}-${entry.completion_time}`);
+      if (!merged.has(key)) merged.set(key, entry);
+    }
+  }
+  return [...merged.values()].sort((a, b) => a.completion_time - b.completion_time);
+}
+
+/**
+ * Browse/search published (custom) levels.
+ * `filter`: `discover` | `new` | `popular` | `liked`. `search`: `by:{username}`.
+ */
+export async function fetchPublishedLevels(
+  options: { filter?: string; page?: number; search?: string } = {},
+): Promise<PublishedLevel[]> {
+  const params = new URLSearchParams({
+    filter: options.filter ?? "discover",
+    page: String(options.page ?? 0),
+  });
+  if (options.search) params.set("search", options.search);
+  const url = `${API_BASE}/published-levels?${params.toString()}`;
+  const payload = await cached(`${url}|published|${options.filter ?? "discover"}|${options.page ?? 0}|${options.search ?? ""}`, PUBLISHED_TTL_MS, () => fetchWithRetry(url));
+  return asList<PublishedLevel>(payload).filter(Boolean);
+}
+
+/** Fetch a run's full payload (inputs base64 etc.) from the replay API. */
+export async function fetchRunReplay(runId: string | number): Promise<RunReplayPayload> {
+  const url = `${API_BASE}/runs/${encodeURIComponent(String(runId))}`;
+  return (await cached(`${url}|run|${runId}`, RUN_TTL_MS, () =>
+    fetchWithRetry(url),
+  )) as RunReplayPayload;
+}
+
+/** Level embed/preview image URL (for the custom map browser). */
+export function levelImageUrl(levelId: string | number): string {
+  return `${API_BASE}/level-image/${encodeURIComponent(String(levelId))}.png`;
 }
 
 /**

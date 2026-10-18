@@ -301,6 +301,7 @@ export async function geneticOptimize(
       rollouts: evaluations,
       bestTimeMs: bestScore < 1e6 ? bestScore * TICK_MS : null,
       bestFinishTick: bestScore < 1e6 ? bestScore : null,
+      bestSymbols: bestFlat.slice(0, 4000),
     });
   }
 

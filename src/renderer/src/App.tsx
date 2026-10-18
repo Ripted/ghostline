@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LevelInfo, LevelPack, SearchMode, SearchParams, SearchResult } from "../../shared/types";
-import type { LevelGeometryPayload, SearchProgressEvent } from "../../preload";
+import type { LevelGeometryPayload, LivePathSnapshot, SearchProgressEvent } from "../../preload";
 import { LEVELS, LEVEL_PACKS } from "../../shared/levels";
 import { ReplayStage } from "./components/ReplayStage";
+import { LeaderboardPanel, type ReplaySelection } from "./components/LeaderboardPanel";
+import { CustomMapBrowser, type CustomLevelSelection } from "./components/CustomMapBrowser";
 import type { LineAnalysis } from "./lib/analysis";
+
+type ActiveTab = "search" | "custom" | "leaderboard";
 
 interface ProgressState {
   message: string;
@@ -47,6 +51,25 @@ export default function App() {
   const [activeSearch, setActiveSearch] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeSearchRef = useRef(false);
+  // Live search preview.
+  const [livePath, setLivePath] = useState<SearchResult["path"] | null>(null);
+  const [liveTick, setLiveTick] = useState<number | null>(null);
+  const liveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Extra brute-force controls.
+  const [actionTicks, setActionTicks] = useState(4);
+  const [maxCandidates, setMaxCandidates] = useState(50_000);
+  const [bruteSeedInputs, setBruteSeedInputs] = useState("");
+  // Playback.
+  const [playing, setPlaying] = useState(false);
+  const [playbackTick, setPlaybackTick] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const playTokenRef = useRef(0);
+  // Replay loaded from leaderboard/run.
+  const [replayPath, setReplayPath] = useState<SearchResult["path"] | null>(null);
+  const [replayArrow, setReplayArrow] = useState("Narrow Arrow");
+  const [replayMeta, setReplayMeta] = useState<{ username?: string; timeS?: number; levelId?: string } | null>(null);
+  // Tabs.
+  const [activeTab, setActiveTab] = useState<ActiveTab>("search");
 
   // Load initial geometry for the default level.
   useEffect(() => {
@@ -122,6 +145,59 @@ export default function App() {
     return unsub;
   }, [refreshRuns]);
 
+  // Live search preview: poll the active search's best path at ~8 Hz.
+  useEffect(() => {
+    if (!activeSearch) {
+      if (liveTimerRef.current) {
+        clearInterval(liveTimerRef.current);
+        liveTimerRef.current = null;
+      }
+      return;
+    }
+    liveTimerRef.current = setInterval(() => {
+      void window.nf
+        .getLivePath()
+        .then((snap: LivePathSnapshot | null) => {
+          if (!snap) return;
+          if (snap.path && snap.path.length) {
+            setLivePath(snap.path);
+          }
+        })
+        .catch(() => {});
+    }, 130);
+    return () => {
+      if (liveTimerRef.current) clearInterval(liveTimerRef.current);
+      liveTimerRef.current = null;
+    };
+  }, [activeSearch]);
+
+  // Playback tick loop.
+  useEffect(() => {
+    if (!playing) return;
+    const source = replayPath && replayPath.length > 1 ? replayPath : path;
+    if (!source || source.length < 2) {
+      setPlaying(false);
+      return;
+    }
+    const token = ++playTokenRef.current;
+    const start = Date.now();
+    let frame: number;
+    const step = () => {
+      if (playTokenRef.current !== token) return;
+      const elapsed = (Date.now() - start) * playbackSpeed;
+      const tick = Math.min(source.length - 1, Math.floor(elapsed / (1000 / 240)));
+      setPlaybackTick(tick);
+      setLiveTick(tick);
+      if (tick >= source.length - 1) {
+        setPlaying(false);
+        return;
+      }
+      frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, [playing, playbackSpeed, replayPath, path]);
+
   const filteredLevels = useMemo(() => {
     if (selectedPack === "all") return levels;
     return levels.filter((l) => l.packId === selectedPack);
@@ -134,6 +210,11 @@ export default function App() {
     setActiveSearch(true);
     setPath(null);
     setAnalysis(null);
+    setLivePath(null);
+    setLiveTick(null);
+    setReplayPath(null);
+    setReplayMeta(null);
+    setPlaying(false);
     setProgress({ ...emptyProgress, message: "Starting search…", done: false });
 
     const params: SearchParams = {
@@ -142,8 +223,15 @@ export default function App() {
       arrowName: arrow,
       budgetSec,
       rngSeed: 1,
-      seedInputs: seedInputs || undefined,
-      ...(mode === "beam" ? { beamWidth, actionRepeat } : {}),
+      ...(mode === "beam"
+        ? { beamWidth, actionRepeat, seedInputs: seedInputs || undefined }
+        : {}),
+      ...(mode === "genetic"
+        ? { seedInputs: seedInputs || undefined }
+        : {}),
+      ...(mode === "brute"
+        ? { actionTicks, maxCandidates, seedInputs: bruteSeedInputs || undefined }
+        : {}),
     };
     try {
       const { searchId } = await window.nf.startSearch(params);
@@ -152,6 +240,7 @@ export default function App() {
       setProgress({ ...emptyProgress, done: true, error: String(err instanceof Error ? err.message : err) });
       setActiveSearch(false);
       activeSearchRef.current = false;
+      setLivePath(null);
     }
   };
 
@@ -160,6 +249,8 @@ export default function App() {
     setActiveSearch(false);
     activeSearchRef.current = false;
     setProgress({ ...progress, done: true, message: "Cancelled." });
+    setLivePath(null);
+    setLiveTick(null);
   };
 
   const importCustom = async () => {
@@ -185,11 +276,51 @@ export default function App() {
 
   const bestTimeMs = progress.done && progress.bestTimeMs != null ? progress.bestTimeMs : null;
 
+  /** Open a leaderboard run's replay: simulate its inputs -> path + arrow. */
+  const openLeaderboardReplay = async (sel: ReplaySelection) => {
+    setReplayMeta({ username: sel.username, timeS: sel.timeS, levelId: sel.levelId });
+    setReplayArrow(sel.arrowName);
+    setLivePath(null);
+    setError(null);
+    try {
+      const sim = await window.nf.simulateReplay({
+        levelId: sel.levelId,
+        arrowName: sel.arrowName,
+        inputs: sel.inputs,
+        inputCount: sel.inputCount,
+      });
+      setReplayPath(sim.path);
+      setPath(sim.path);
+      setAnalysis(null);
+      setPlaybackTick(0);
+      setLiveTick(0);
+      setPlaying(false);
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  /** Load a custom level from the browser into the map. */
+  const openCustomLevel = async (sel: CustomLevelSelection) => {
+    setSelectedLevelId(sel.levelId);
+    setGeometry(sel.geometry);
+    setPath(null);
+    setReplayPath(null);
+    setReplayMeta(null);
+    setAnalysis(null);
+    setError(null);
+    setActiveTab("search");
+  };
+
+  const displayPath = replayPath && replayPath.length > 1 ? replayPath : path;
+  const displayArrow = replayPath && replayPath.length > 1 ? replayArrow : arrow;
+  const markerIdx = playing || liveTick != null ? liveTick ?? 0 : null;
+
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "300px 1fr",
+        gridTemplateColumns: "310px 1fr",
         gap: 14,
         padding: 16,
         height: "100vh",
@@ -198,7 +329,7 @@ export default function App() {
         background: "#0b0e14",
       }}
     >
-      {/* Left: controls */}
+      {/* Left: controls / panels */}
       <aside style={{ display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", paddingRight: 4 }}>
         <header>
           <h1 style={{ fontSize: 18, margin: 0, color: "#fff" }}>Narrow Route Finder</h1>
@@ -207,119 +338,188 @@ export default function App() {
           </p>
         </header>
 
-        <label style={labelStyle}>
-          Pack
-          <select
-            style={selectStyle}
-            value={selectedPack}
-            onChange={(e) => setSelectedPack(e.target.value)}
-          >
-            <option value="all">All packs</option>
-            {packs.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        <nav style={{ display: "flex", gap: 4 }}>
+          {(
+            [
+              { id: "search", label: "Search" },
+              { id: "custom", label: "Custom maps" },
+              { id: "leaderboard", label: "Leaderboard" },
+            ] as Array<{ id: ActiveTab; label: string }>
+          ).map((t) => (
+            <button
+              key={t.id}
+              style={{
+                ...tabButtonStyle,
+                ...(activeTab === t.id ? { background: "#21262d", color: "#fff" } : {}),
+              }}
+              onClick={() => setActiveTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
 
-        <label style={labelStyle}>
-          Level
-          <select
-            style={{ ...selectStyle, maxWidth: "100%" }}
-            value={selectedLevelId}
-            onChange={(e) => void loadLevel(e.target.value)}
-          >
-            {filteredLevels.map((l) => (
-              <option key={l.id} value={l.id}>
-                {l.name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label style={labelStyle}>
-          Arrow
-          <select style={selectStyle} value={arrow} onChange={(e) => setArrow(e.target.value)}>
-            <option>Narrow Arrow</option>
-            <option>Speedy Arrow</option>
-            <option>Energy Arrow</option>
-          </select>
-        </label>
-
-        <label style={labelStyle}>
-          Search mode
-          <select style={selectStyle} value={mode} onChange={(e) => setMode(e.target.value as SearchMode)}>
-            <option value="beam">Beam search</option>
-            <option value="genetic">Genetic optimizer</option>
-            <option value="brute">Action-repeat brute force</option>
-          </select>
-        </label>
-
-        {mode === "beam" && (
+        {activeTab === "leaderboard" ? (
+          <LeaderboardPanel
+            levelId={selectedLevelId}
+            deep
+            onOpenReplay={(sel) => void openLeaderboardReplay(sel)}
+          />
+        ) : activeTab === "custom" ? (
+          <CustomMapBrowser onOpenLevel={(sel) => void openCustomLevel(sel)} />
+        ) : (
           <>
             <label style={labelStyle}>
-              Beam width
-              <input
-                style={inputStyle}
-                type="number"
-                min={2}
-                max={512}
-                value={beamWidth}
-                onChange={(e) => setBeamWidth(Math.max(2, Number(e.target.value)))}
-              />
+              Pack
+              <select
+                style={selectStyle}
+                value={selectedPack}
+                onChange={(e) => setSelectedPack(e.target.value)}
+              >
+                <option value="all">All packs</option>
+                {packs.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
             </label>
+
             <label style={labelStyle}>
-              Action repeat (ticks)
+              Level
+              <select
+                style={{ ...selectStyle, maxWidth: "100%" }}
+                value={selectedLevelId}
+                onChange={(e) => void loadLevel(e.target.value)}
+              >
+                {filteredLevels.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label style={labelStyle}>
+              Arrow
+              <select style={selectStyle} value={arrow} onChange={(e) => setArrow(e.target.value)}>
+                <option>Narrow Arrow</option>
+                <option>Speedy Arrow</option>
+                <option>Energy Arrow</option>
+              </select>
+            </label>
+
+            <label style={labelStyle}>
+              Search mode
+              <select style={selectStyle} value={mode} onChange={(e) => setMode(e.target.value as SearchMode)}>
+                <option value="beam">Beam search</option>
+                <option value="genetic">Genetic optimizer</option>
+                <option value="brute">Action-repeat brute force</option>
+              </select>
+            </label>
+
+            {mode === "beam" && (
+              <>
+                <label style={labelStyle}>
+                  Beam width
+                  <input
+                    style={inputStyle}
+                    type="number"
+                    min={2}
+                    max={512}
+                    value={beamWidth}
+                    onChange={(e) => setBeamWidth(Math.max(2, Number(e.target.value)))}
+                  />
+                </label>
+                <label style={labelStyle}>
+                  Action repeat (ticks)
+                  <input
+                    style={inputStyle}
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={actionRepeat}
+                    onChange={(e) => setActionRepeat(Math.max(1, Number(e.target.value)))}
+                  />
+                </label>
+              </>
+            )}
+
+            {mode === "genetic" && (
+              <label style={labelStyle}>
+                Seed run (base64 inputs)
+                <textarea
+                  style={{ ...inputStyle, height: 60, resize: "vertical", fontFamily: "monospace" }}
+                  placeholder="Paste a known input base64 to polish"
+                  value={seedInputs}
+                  onChange={(e) => setSeedInputs(e.target.value)}
+                />
+              </label>
+            )}
+
+            {mode === "brute" && (
+              <>
+                <label style={labelStyle}>
+                  Action ticks per decision
+                  <input
+                    style={inputStyle}
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={actionTicks}
+                    onChange={(e) => setActionTicks(Math.max(1, Number(e.target.value)))}
+                  />
+                </label>
+                <label style={labelStyle}>
+                  Max candidates
+                  <input
+                    style={inputStyle}
+                    type="number"
+                    min={100}
+                    max={2_000_000}
+                    value={maxCandidates}
+                    onChange={(e) => setMaxCandidates(Math.max(100, Number(e.target.value)))}
+                  />
+                </label>
+                <label style={labelStyle}>
+                  Seed prefix (base64, optional)
+                  <textarea
+                    style={{ ...inputStyle, height: 50, resize: "vertical", fontFamily: "monospace" }}
+                    placeholder="Start from a known prefix"
+                    value={bruteSeedInputs}
+                    onChange={(e) => setBruteSeedInputs(e.target.value)}
+                  />
+                </label>
+              </>
+            )}
+
+            <label style={labelStyle}>
+              Budget (seconds)
               <input
                 style={inputStyle}
                 type="number"
                 min={1}
-                max={120}
-                value={actionRepeat}
-                onChange={(e) => setActionRepeat(Math.max(1, Number(e.target.value)))}
+                max={600}
+                value={budgetSec}
+                onChange={(e) => setBudgetSec(Math.max(1, Number(e.target.value)))}
               />
             </label>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={primaryButtonStyle} onClick={() => void startSearch()} disabled={activeSearch}>
+                {activeSearch ? "Searching…" : "Run search"}
+              </button>
+              {activeSearch && (
+                <button style={dangerButtonStyle} onClick={() => void cancelSearch()}>
+                  Cancel
+                </button>
+              )}
+            </div>
+            <button style={linkButtonStyle} onClick={() => void importCustom()}>
+              Import custom map from file…
+            </button>
           </>
         )}
-
-        {mode === "genetic" && (
-          <label style={labelStyle}>
-            Seed run (base64 inputs)
-            <textarea
-              style={{ ...inputStyle, height: 60, resize: "vertical", fontFamily: "monospace" }}
-              placeholder="Paste a know input base64 to polish"
-              value={seedInputs}
-              onChange={(e) => setSeedInputs(e.target.value)}
-            />
-          </label>
-        )}
-
-        <label style={labelStyle}>
-          Budget (seconds)
-          <input
-            style={inputStyle}
-            type="number"
-            min={1}
-            max={600}
-            value={budgetSec}
-            onChange={(e) => setBudgetSec(Math.max(1, Number(e.target.value)))}
-          />
-        </label>
-
-        <div style={{ display: "flex", gap: 8 }}>
-          <button style={primaryButtonStyle} onClick={() => void startSearch()} disabled={activeSearch}>
-            {activeSearch ? "Searching…" : "Run search"}
-          </button>
-          {activeSearch && (
-            <button style={dangerButtonStyle} onClick={() => void cancelSearch()}>
-              Cancel
-            </button>
-          )}
-        </div>
-        <button style={linkButtonStyle} onClick={() => void importCustom()}>
-          Import custom map…
-        </button>
 
         {error && (
           <div style={{ color: "#f85149", fontSize: 12, background: "rgba(248,81,73,0.12)", padding: 8, borderRadius: 6 }}>
@@ -328,23 +528,26 @@ export default function App() {
         )}
 
         {/* Progress */}
-        <div style={{ background: "#151a23", borderRadius: 8, padding: 10 }}>
-          <strong style={{ fontSize: 12, color: "#9d8dff" }}>{mode}</strong>
-          <p style={{ fontSize: 12, margin: "6px 0 0", color: progress.error ? "#f85149" : "#c9d1d9" }}>
-            {progress.error ?? progress.message}
-          </p>
-          {bestTimeMs != null && (
-            <p style={{ fontSize: 14, color: "#3fb950", margin: "4px 0 0" }}>
-              Best: {(bestTimeMs / 1000).toFixed(3)}s
+        {activeTab === "search" && (
+          <div style={{ background: "#151a23", borderRadius: 8, padding: 10 }}>
+            <strong style={{ fontSize: 12, color: "#9d8dff" }}>{mode}</strong>
+            <p style={{ fontSize: 12, margin: "6px 0 0", color: progress.error ? "#f85149" : "#c9d1d9" }}>
+              {progress.error ?? progress.message}
             </p>
-          )}
-          {(progress.evaluations > 0 || progress.rollouts > 0) && !progress.done && (
-            <p style={{ fontSize: 11, color: "#7d8590", margin: "4px 0 0" }}>
-              {progress.evaluations.toLocaleString()} evals · gen {progress.generations}
-            </p>
-          )}
-          {progress.done && progress.error && <p style={{ fontSize: 11, color: "#f85149" }}>{progress.error}</p>}
-        </div>
+            {bestTimeMs != null && (
+              <p style={{ fontSize: 14, color: "#3fb950", margin: "4px 0 0" }}>
+                Best: {(bestTimeMs / 1000).toFixed(3)}s
+              </p>
+            )}
+            {(progress.evaluations > 0 || progress.rollouts > 0) && (
+              <p style={{ fontSize: 11, color: "#7d8590", margin: "4px 0 0" }}>
+                {progress.evaluations.toLocaleString()} evals · gen {progress.generations}
+                {livePath && livePath.length > 0 ? ` · live ${livePath.length.toLocaleString()} pts` : ""}
+              </p>
+            )}
+            {progress.done && progress.error && <p style={{ fontSize: 11, color: "#f85149" }}>{progress.error}</p>}
+          </div>
+        )}
       </aside>
 
       {/* Right: map + analysis + runs */}
@@ -354,7 +557,11 @@ export default function App() {
             <>
               <ReplayStage
                 geometry={geometry}
-                path={path}
+                path={displayPath}
+                arrowName={displayArrow}
+                markerIndex={markerIdx}
+                livePath={livePath}
+                liveTick={playing || liveTick != null ? liveTick : null}
                 onPathAnalysis={setAnalysis}
                 width={920}
                 height={640}
@@ -374,17 +581,83 @@ export default function App() {
           )}
         </div>
 
-        {analysis && path && (
+        {/* Replay transport */}
+        {(displayPath && displayPath.length > 1) && (
+          <div style={{ background: "#151a23", borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+            <button
+              style={smallButtonStyle}
+              onClick={() => {
+                if (playing) {
+                  setPlaying(false);
+                } else {
+                  if (liveTick == null || liveTick >= displayPath.length - 1) {
+                    setPlaybackTick(0);
+                    setLiveTick(0);
+                  }
+                  setPlaying(true);
+                }
+              }}
+            >
+              {playing ? "⏸ Pause" : "▶ Play"}
+            </button>
+            <button
+              style={smallButtonStyle}
+              onClick={() => {
+                setPlaying(false);
+                setPlaybackTick(0);
+                setLiveTick(0);
+              }}
+            >
+              ⏮
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={Math.max(1, displayPath.length - 1)}
+              value={playbackTick}
+              onChange={(e) => {
+                setPlaying(false);
+                const t = Number(e.target.value);
+                setPlaybackTick(t);
+                setLiveTick(t);
+              }}
+              style={{ flex: 1, accentColor: "#7ad4ff" }}
+            />
+            <span style={{ color: "#7d8590", whiteSpace: "nowrap" }}>
+              {(((liveTick ?? 0) / 240)).toFixed(2)}s / {(displayPath.length / 240).toFixed(2)}s
+            </span>
+            <select
+              value={playbackSpeed}
+              onChange={(e) => setPlaybackSpeed(Number(e.target.value))}
+              style={miniSelectStyle}
+            >
+              {[0.25, 0.5, 1, 2, 4].map((s) => (
+                <option key={s} value={s}>
+                  {s}×
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {replayMeta && (
+          <div style={{ fontSize: 11, color: "#9aa4b2", background: "rgba(157,141,255,0.08)", border: "1px solid rgba(157,141,255,0.2)", borderRadius: 8, padding: "5px 10px" }}>
+            Viewing <b style={{ color: "#e6edf3" }}>{replayMeta.username}</b>'s replay ({replayArrow}) ·{' '}
+            {replayMeta.timeS != null ? `${replayMeta.timeS.toFixed(3)}s` : "?"}
+          </div>
+        )}
+
+        {analysis && displayPath && displayPath.length > 1 && (
           <div style={{ background: "#151a23", borderRadius: 8, padding: 10, fontSize: 12, display: "flex", gap: 16, flexWrap: "wrap" }}>
             <span>Distance <b>{(analysis.distancePx).toFixed(0)}px</b></span>
             <span>Avg speed <b>{analysis.avgSpeed.toFixed(1)}px/s</b></span>
             <span>Max <b>{analysis.maxSpeed.toFixed(1)}</b></span>
             <span>Brake % <b>{(analysis.brakeFraction * 100).toFixed(1)}%</b></span>
-            <span>Ticks <b>{path.length}</b></span>
+            <span>Ticks <b>{displayPath.length}</b></span>
           </div>
         )}
 
-        <section style={{ overflowY: "auto", maxHeight: "32%" }}>
+        <section style={{ overflowY: "auto", maxHeight: "30%" }}>
           <h3 style={{ margin: "4px 0 6px", fontSize: 13, color: "#c9d1d9" }}>Saved runs ({runs.length})</h3>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
@@ -418,7 +691,19 @@ export default function App() {
                     <button style={smallButtonStyle} onClick={() => exportRun(run)}>
                       Export
                     </button>
-                    <button style={smallButtonStyle} onClick={() => loadSavedRun(run, setPath, setAnalysis)}>
+                    <button
+                      style={smallButtonStyle}
+                      onClick={() => {
+                        setPath(run.path);
+                        setReplayPath(null);
+                        setReplayMeta(null);
+                        setReplayArrow(run.arrowName);
+                        setAnalysis(null);
+                        setPlaybackTick(0);
+                        setLiveTick(0);
+                        setPlaying(false);
+                      }}
+                    >
                       Load
                     </button>
                   </td>
@@ -428,7 +713,7 @@ export default function App() {
           </table>
         </section>
         <div style={{ fontSize: 11, color: "#7d8590", textAlign: "center" }}>
-          Physics engine: Narrow Arrow Rust/WASM @ 240Hz · deterministic seeded search
+          Physics engine: Narrow Arrow Rust/WASM @ 240Hz · deterministic seeded search · live progress from worker pool
         </div>
       </main>
     </div>
@@ -442,19 +727,6 @@ function LegendDot({ color, label }: { color: string; label: string }) {
       {label}
     </span>
   );
-}
-
-function loadSavedRun(
-  run: SearchResult,
-  setPath: (p: SearchResult["path"]) => void,
-  setAnalysis: (a: LineAnalysis | null) => void,
-) {
-  setPath(run.path);
-  setAnalysis(null);
-  if (run.path && run.path.length) {
-    // Trigger analysis via the stage draw.
-    // We set a non-null path; the analysis fires there.
-  }
 }
 
 const labelStyle: React.CSSProperties = {
@@ -524,6 +796,26 @@ const smallButtonStyle: React.CSSProperties = {
   fontSize: 11,
   marginRight: 4,
   cursor: "pointer",
+};
+
+const tabButtonStyle: React.CSSProperties = {
+  background: "transparent",
+  color: "#9aa4b2",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  padding: "5px 10px",
+  fontSize: 12,
+  cursor: "pointer",
+  flex: 1,
+};
+
+const miniSelectStyle: React.CSSProperties = {
+  background: "#151a23",
+  color: "#e6edf3",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  padding: "3px 6px",
+  fontSize: 11,
 };
 
 const thStyle: React.CSSProperties = {

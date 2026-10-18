@@ -8,10 +8,19 @@
 import { app, dialog, ipcMain, BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { LevelInfo, SearchParams, SearchResult, RawLevelData } from "../shared/types.ts";
+import type { LevelInfo, SearchParams, SearchResult, RawLevelData, LeaderboardEntry, PublishedLevel, RunReplayPayload } from "../shared/types.ts";
 import { LEVELS, LEVEL_PACKS } from "../shared/levels.ts";
-import { fetchLevelData, normalizeCustomMap } from "./fetch/upstream.ts";
+import {
+  fetchLeaderboard,
+  fetchLevelData,
+  fetchPublishedLevels,
+  fetchRunReplay,
+  levelImageUrl,
+  normalizeCustomMap,
+} from "./fetch/upstream.ts";
 import { Coordinator } from "./search/coordinator.ts";
+import { simulateRunExact } from "./search/engine.ts";
+import { decodeInputSymbols } from "../shared/codec.ts";
 import {
   cacheLevel,
   deleteRun,
@@ -27,6 +36,8 @@ interface ActiveSearch {
 }
 
 let activeSearch: ActiveSearch | null = null;
+/** Cache the level data for the active search (needed for live path sims). */
+let activeLevelData: RawLevelData | null = null;
 
 /** Send a progress update to the renderer. */
 function emitProgress(payload: unknown) {
@@ -48,16 +59,18 @@ export function registerIpc() {
   ipcMain.handle(
     "nf:getLevelData",
     async (_e: IpcMainInvokeEvent, id: string): Promise<{ level: LevelInfo; geometry: ReturnType<typeof levelGeometry> }> => {
-      const level = LEVELS.find((l) => l.id === id);
-      if (!level) throw new Error(`Unknown level ${id}`);
       const cached = readCachedLevel(id);
-      let data: RawLevelData | null = null;
-      if (cached) data = cached.data;
-      else {
-        data = await fetchLevelData(id);
-        cacheLevel({ id, name: level.name, data, fetchedAt: Date.now() });
-      }
-      return { level, geometry: levelGeometry(data) };
+      if (cached) return { level: { id, name: cached.name ?? id, gameOrder: 0, packId: "custom" }, geometry: levelGeometry(cached.data) };
+      const level = LEVELS.find((l) => l.id === id);
+      // Unknown levels are still fetchable (published/custom maps): fetchLevelData
+      // hits `level-details/{id}?isCustomLevel=true` which works for any ID.
+      const data = await fetchLevelData(id);
+      const name = level?.name ?? data.map_name ?? id;
+      cacheLevel({ id, name, data, fetchedAt: Date.now() });
+      return {
+        level: level ?? { id, name, gameOrder: 0, packId: "custom" },
+        geometry: levelGeometry(data),
+      };
     },
   );
 
@@ -110,6 +123,7 @@ export function registerIpc() {
 
     const coordinator = new Coordinator(data);
     activeSearch = { coordinator, params };
+    activeLevelData = data;
 
     // Run the search without holding up the invoke; resolve immediately with a
     // searchId, and stream progress/results over events.
@@ -121,15 +135,18 @@ export function registerIpc() {
           saveRun(r);
           emitProgress({ ...r, done: true, searchId });
           activeSearch = null;
+          activeLevelData = null;
         },
         onError: (err) => {
           emitProgress({ error: String(err?.message ?? err), done: true, searchId });
           activeSearch = null;
+          activeLevelData = null;
         },
       })
       .catch((err) => {
         emitProgress({ error: String(err?.message ?? err), done: true, searchId });
         activeSearch = null;
+        activeLevelData = null;
       });
 
     return { searchId };
@@ -138,8 +155,83 @@ export function registerIpc() {
   ipcMain.handle("nf:cancelSearch", () => {
     activeSearch?.coordinator.stop();
     activeSearch = null;
+    activeLevelData = null;
     return true;
   });
+
+  ipcMain.handle("nf:getLivePath", async (): Promise<unknown | null> => {
+    const search = activeSearch;
+    if (!search || !activeLevelData) return null;
+    const bestSymbols = search.coordinator.bestSymbols;
+    if (!bestSymbols || bestSymbols.length === 0) {
+      return { searchId: search.params.levelId, bestSymbols: [], path: [] as unknown[], done: false };
+    }
+    // Downsample for cheap live preview (cap 2000 pts, stride ~8).
+    const stride = Math.max(1, Math.floor(bestSymbols.length / 2000));
+    let sampled: number[] = bestSymbols;
+    if (stride > 1) {
+      sampled = [];
+      for (let i = 0; i < bestSymbols.length; i += stride) sampled.push(bestSymbols[i]);
+    }
+    const sim = await simulateRunExact(activeLevelData, search.params.arrowName, sampled);
+    return {
+      searchId: search.params.levelId,
+      bestSymbols,
+      path: sim.path,
+      finishTick: sim.finishTick,
+      mode: search.params.mode,
+      arrowName: search.params.arrowName,
+    };
+  });
+
+  ipcMain.handle(
+    "nf:simulateReplay",
+    async (_e, options: { levelId: string; arrowName?: string; inputs?: string; inputCount?: number }) => {
+      const level = LEVELS.find((l) => l.id === options.levelId);
+      let data: RawLevelData;
+      if (level) {
+        const cached = readCachedLevel(options.levelId);
+        if (cached) data = cached.data;
+        else {
+          data = await fetchLevelData(options.levelId);
+          cacheLevel({ id: options.levelId, name: level.name, data, fetchedAt: Date.now() });
+        }
+      } else {
+        const cached = readCachedLevel(options.levelId);
+        if (!cached) throw new Error(`Unknown level ${options.levelId} (import it first).`);
+        data = cached.data;
+      }
+      const symbols = options.inputs
+        ? decodeInputSymbols(options.inputs, options.inputCount)
+        : [];
+      const sim = await simulateRunExact(data, options.arrowName, symbols);
+      return {
+        path: sim.path,
+        finishTick: sim.finishTick,
+        timeMs: sim.finishTick != null ? sim.finishTick * (1000 / 240) : null,
+      };
+    },
+  );
+
+  // ---- Game API additions --------------------------------------------------
+  ipcMain.handle(
+    "nf:getLeaderboard",
+    async (_e, options: { levelId: string; deep?: boolean; arrowFilter?: string }): Promise<LeaderboardEntry[]> =>
+      fetchLeaderboard(options.levelId, { deep: options.deep, arrowFilter: options.arrowFilter }),
+  );
+
+  ipcMain.handle(
+    "nf:listPublishedLevels",
+    async (_e, options: { filter?: string; page?: number; search?: string }): Promise<PublishedLevel[]> =>
+      fetchPublishedLevels({ filter: options?.filter, page: options?.page, search: options?.search }),
+  );
+
+  ipcMain.handle(
+    "nf:getRunReplay",
+    async (_e, runId: string | number): Promise<RunReplayPayload> => fetchRunReplay(runId),
+  );
+
+  ipcMain.handle("nf:levelImageUrl", (_e, levelId: string | number) => levelImageUrl(levelId));
 
   // ---- Saved runs + export ------------------------------------------------
   ipcMain.handle("nf:listRuns", () => listRuns());

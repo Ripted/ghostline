@@ -146,6 +146,7 @@ export async function beamSearch(
       rollouts: evaluations,
       bestTimeMs: best ? best.timeMs : null,
       bestFinishTick: best ? best.finishTick : null,
+      bestSymbols: best ? best.symbols.slice(0, 4000) : undefined,
     });
 
     // If every expanded node died / finished no progress made a finishing run would require expansion.

@@ -3,9 +3,19 @@
  */
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import type { LevelGeometryPayload, LevelInfo, LevelPack, SearchParams, SearchResult, SimPoint } from "../shared/types";
+import type { LeaderboardEntry, LevelGeometryPayload, LevelInfo, LevelPack, PublishedLevel, RunReplayPayload, SearchParams, SearchResult, SimPoint } from "../shared/types";
 
 export type { LevelGeometryPayload };
+
+/** A live snapshot of the running search's best path. */
+export interface LivePathSnapshot {
+  searchId?: string;
+  bestSymbols?: number[];
+  path?: SimPoint[];
+  finishTick?: number | null;
+  mode?: SearchParams["mode"];
+  arrowName?: string;
+}
 
 export interface SearchProgressEvent {
   searchId: string;
@@ -20,6 +30,9 @@ export interface SearchProgressEvent {
   evaluations?: number;
   generations?: number;
   rollouts?: number;
+  bestSymbols?: number[];
+  /** Live path snapshot (from nf:getLivePath). */
+  path?: SimPoint[];
   result?: SearchResult;
 }
 
@@ -35,6 +48,28 @@ export interface NfApi {
   deleteRun(id: string): Promise<boolean>;
   exportRun(run: SearchResult): Promise<{ saved: boolean; path?: string }>;
   onSearchProgress(cb: (evt: SearchProgressEvent) => void): () => void;
+  // ---- Game API additions -------------------------------------------------
+  getLeaderboard(options: {
+    levelId: string;
+    deep?: boolean;
+    arrowFilter?: string;
+  }): Promise<LeaderboardEntry[]>;
+  listPublishedLevels(options: {
+    filter?: string;
+    page?: number;
+    search?: string;
+  }): Promise<PublishedLevel[]>;
+  getRunReplay(runId: string | number): Promise<RunReplayPayload>;
+  levelImageUrl(levelId: string | number): string;
+  /** Poll the active search's current best path (downsampled) at frame rate. */
+  getLivePath(): Promise<LivePathSnapshot | null>;
+  /** Simulate an arbitrary replay (inputs + arrow) on a level -> full path. */
+  simulateReplay(options: {
+    levelId: string;
+    arrowName?: string;
+    inputs?: string;
+    inputCount?: number;
+  }): Promise<{ path: SimPoint[]; finishTick: number | null; timeMs: number | null }>;
 }
 
 const api: NfApi = {
@@ -48,6 +83,12 @@ const api: NfApi = {
   listRuns: () => ipcRenderer.invoke("nf:listRuns"),
   deleteRun: (id) => ipcRenderer.invoke("nf:deleteRun", id),
   exportRun: (run) => ipcRenderer.invoke("nf:exportRun", run),
+  getLeaderboard: (options) => ipcRenderer.invoke("nf:getLeaderboard", options),
+  listPublishedLevels: (options) => ipcRenderer.invoke("nf:listPublishedLevels", options),
+  getRunReplay: (runId) => ipcRenderer.invoke("nf:getRunReplay", runId),
+  levelImageUrl: (levelId) => `https://api.narrowarrow.xyz/level-image/${encodeURIComponent(String(levelId))}.png`,
+  getLivePath: () => ipcRenderer.invoke("nf:getLivePath"),
+  simulateReplay: (options) => ipcRenderer.invoke("nf:simulateReplay", options),
   onSearchProgress: (cb) => {
     const listener = (_e: IpcRendererEvent, payload: SearchProgressEvent) => cb(payload);
     ipcRenderer.on("nf:progress", listener);

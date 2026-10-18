@@ -92,6 +92,46 @@ export interface LevelPack {
 
 export type SearchMode = "beam" | "genetic" | "brute";
 
+/** A run entry from `GET /leaderboard?levelId=...` (public). */
+export interface LeaderboardEntry {
+  run_id: number;
+  completion_time: number;
+  username: string;
+  arrow_name?: string;
+  created_at?: string;
+  replay_available?: number;
+  is_verifier?: boolean;
+}
+
+/** A published/custom level summary from `GET /published-levels`. */
+export interface PublishedLevel {
+  id?: string | number;
+  level_id?: string;
+  name?: string;
+  title?: string;
+  creator_name?: string;
+  author?: string;
+  username?: string;
+  plays?: number;
+  likes?: number;
+  like_count?: number;
+  worldRecord?: { runId?: number; completion_time?: number } | null;
+  runCount?: number;
+  map_name?: string;
+  data?: RawLevelData;
+}
+
+/** A replay payload from `GET /runs/{id}`. */
+export interface RunReplayPayload {
+  inputs?: string;
+  input_count?: number;
+  completion_time?: number;
+  mapName?: string;
+  level_id?: string;
+  arrow_name?: string;
+  skinConfig?: unknown;
+}
+
 export interface SearchParams {
   mode: SearchMode;
   levelId: string;

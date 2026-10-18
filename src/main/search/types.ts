@@ -42,6 +42,8 @@ export interface ProgressSink {
     rollouts: number;
     bestTimeMs: number | null;
     bestFinishTick: number | null;
+    /** Current best run's symbol stream (for live path visualization). */
+    bestSymbols?: number[];
   }): void;
 }
 

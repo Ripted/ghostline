@@ -1,17 +1,25 @@
 /**
  * ReplayStage — canvas renderer for the map + replay path overlay, ported from
  * the rankings site's `ReplayViewer.tsx` draw logic (walls, zones, portals,
- * finish, arrow marker) plus a "racing line" path (speed-coloured).
+ * finish, arrow marker) plus a "racing line" path (speed-coloured) and the
+ * game's real arrow sprites.
  */
 import { useEffect, useRef } from "react";
 import type { LevelGeometryPayload, SimPoint, SimWall, SimZone, SimPortal } from "../../../shared/types";
 import { analyseLine, speedColour, type LineAnalysis } from "../lib/analysis";
+import { arrowKind, drawArrowSprite } from "../lib/arrow-sprites";
 
 export interface ReplayStageProps {
   geometry: LevelGeometryPayload["geometry"];
   path: SimPoint[] | null;
   /** Index into the path to show live (null = full path). */
   markerIndex?: number | null;
+  /** Arrow used in the replay; controls which sprite is drawn. */
+  arrowName?: string | null;
+  /** Extra live prefix path to draw while a search is running. */
+  livePath?: SimPoint[] | null;
+  /** Tick position in the live path (for the moving marker). */
+  liveTick?: number | null;
   onPathAnalysis?: (a: LineAnalysis) => void;
   width?: number;
   height?: number;
@@ -47,16 +55,19 @@ export function ReplayStage({
   geometry,
   path,
   markerIndex,
+  arrowName,
+  livePath,
+  liveTick,
   onPathAnalysis,
   width = 860,
   height = 620,
 }: ReplayStageProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const propsRef = useRef({ geometry, path, markerIndex });
-  propsRef.current = { geometry, path, markerIndex };
+  const propsRef = useRef({ geometry, path, markerIndex, arrowName, livePath, liveTick });
+  propsRef.current = { geometry, path, markerIndex, arrowName, livePath, liveTick };
 
   useEffect(() => {
-    const { geometry: g, path: p, markerIndex: mi } = propsRef.current;
+    const { geometry: g, path: p, markerIndex: mi, arrowName: an, livePath: live, liveTick: lti } = propsRef.current;
     const walls = g.walls as SimWall[];
     const zones = g.zones as SimZone[];
     const portals = g.portals as SimPortal[];
@@ -77,6 +88,7 @@ export function ReplayStage({
         { x: po.bx, y: po.by },
       ]),
       ...(p ?? []),
+      ...(live ?? []),
     ];
     if (all.length === 0) return;
     const xs = all.map((pt) => pt.x);
@@ -182,13 +194,36 @@ export function ReplayStage({
       }
     }
 
-    // Arrow marker for live progress.
-    if (p && mi != null && mi >= 0 && mi < p.length) {
-      drawArrow(ctx, { x: p[mi].x, y: p[mi].y, rot: p[mi].rot ?? 0 }, scale);
-    } else if (p && p.length > 0 && mi == null) {
-      drawArrow(ctx, { x: p[p.length - 1].x, y: p[p.length - 1].y, rot: p[p.length - 1].rot ?? 0 }, scale);
+    // Live search path (thinner, translucent purple beats the racing line).
+    if (live && live.length >= 2) {
+      ctx.lineWidth = 1.8;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "rgba(157, 141, 255, 0.55)";
+      ctx.beginPath();
+      for (let i = 0; i < live.length; i++) {
+        if (i === 0) ctx.moveTo(X(live[i].x), Y(live[i].y));
+        else ctx.lineTo(X(live[i].x), Y(live[i].y));
+      }
+      ctx.stroke();
     }
-  }, [geometry, path, markerIndex, width, height, onPathAnalysis]);
+
+    // Arrow marker: prefer the game sprite, fall back to the simple triangle.
+    const arrowPoint =
+      (p && mi != null && mi >= 0 && mi < p.length && p[mi]) ||
+      (p && p.length > 0 && mi == null && p[p.length - 1]) ||
+      (live && lti != null && lti >= 0 && lti < live.length && live[lti]) ||
+      (live && live.length > 0 && lti == null && live[live.length - 1]) ||
+      null;
+
+    if (arrowPoint) {
+      try {
+        drawArrowSprite(ctx, arrowKind(an), arrowPoint.x, arrowPoint.y, arrowPoint.rot ?? 0, scale, 14, "#7ad4ff", "#3b5f77");
+      } catch {
+        drawArrow(ctx, arrowPoint, scale);
+      }
+    }
+  }, [geometry, path, markerIndex, arrowName, livePath, liveTick, width, height, onPathAnalysis]);
 
   return (
     <canvas

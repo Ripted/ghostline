@@ -24,6 +24,8 @@ export interface SearchProgress {
   evaluations: number;
   generations: number;
   rollouts: number;
+  /** Current best run's symbol stream — renderer simulates it live. */
+  bestSymbols?: number[];
 }
 
 export interface CoordinatorEvents {
@@ -34,8 +36,14 @@ export interface CoordinatorEvents {
 
 export class Coordinator {
   private pool: SearchPool | null = null;
+  private currentBestSymbols: number[] | null = null;
 
   constructor(private readonly levelData: RawLevelData) {}
+
+  /** Latest best symbol stream seen during a run (null before first progress). */
+  get bestSymbols(): number[] | null {
+    return this.currentBestSymbols;
+  }
 
   async run(params: SearchParams, events: CoordinatorEvents): Promise<SearchResult> {
     const pool = new SearchPool();
@@ -55,6 +63,7 @@ export class Coordinator {
     const rngSeed = params.rngSeed ?? 1;
 
     const sink: ProgressSink = (u) => {
+      if (u.bestSymbols) this.currentBestSymbols = u.bestSymbols.slice();
       events.onProgress?.({
         searchId: params.levelId,
         message: u.message,
@@ -67,6 +76,7 @@ export class Coordinator {
         evaluations: u.evaluations,
         generations: u.generations,
         rollouts: u.rollouts,
+        bestSymbols: u.bestSymbols,
       });
     };
 
