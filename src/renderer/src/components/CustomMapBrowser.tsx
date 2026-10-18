@@ -144,9 +144,15 @@ export function CustomMapBrowser({ onOpenLevel }: CustomMapBrowserProps) {
               <div style={{ color: "#7d8590", margin: "2px 0 6px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 by {creatorOf(l)}
               </div>
-              {(l.plays != null || l.like_count != null || l.likes != null) && (
-                <div style={{ color: "#9aa4b2", marginBottom: 6 }}>
-                  {(l.plays ?? 0).toLocaleString()} plays · {(l.like_count ?? l.likes ?? 0).toLocaleString()} likes
+              {(l.play_count != null || l.plays != null || l.like_count != null || l.likes != null) && (
+                <div style={{ color: "#9aa4b2", marginBottom: 4 }}>
+                  {(l.play_count ?? l.plays ?? 0).toLocaleString()} plays · {(l.like_count ?? l.likes ?? 0).toLocaleString()} likes
+                </div>
+              )}
+              {l.world_record && l.world_record.completion_time != null && (
+                <div style={{ color: "#f0b429", fontSize: 11, marginBottom: 6 }}>
+                  WR {l.world_record.completion_time.toFixed(3)}s{l.world_record.username ? ` · ${l.world_record.username}` : ""}
+                  {l.world_record.arrow_name ? ` (${l.world_record.arrow_name})` : ""}
                 </div>
               )}
               <button style={primaryButtonStyle} onClick={() => void openLevel(l)} disabled={opening === id}>

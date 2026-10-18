@@ -113,12 +113,23 @@ export interface PublishedLevel {
   author?: string;
   username?: string;
   plays?: number;
+  play_count?: number;
   likes?: number;
   like_count?: number;
-  worldRecord?: { runId?: number; completion_time?: number } | null;
+  worldRecord?: WorldRecordInfo | null;
+  world_record?: WorldRecordInfo | null;
   runCount?: number;
   map_name?: string;
   data?: RawLevelData;
+}
+
+/** A level's world-record summary (snake_case returned by the API). */
+export interface WorldRecordInfo {
+  runId?: number;
+  run_id?: number;
+  completion_time?: number;
+  arrow_name?: string;
+  username?: string;
 }
 
 /** A replay payload from `GET /runs/{id}`. */
