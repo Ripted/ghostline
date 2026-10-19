@@ -16,11 +16,27 @@ with three selectable search modes.
 - **Real engine, deterministic**: every candidate rolls out through the bundled WASM
   `GameMechanicsEngine` (240 Hz input ticks); seeded RNG makes searches reproducible.
 - **Map picker** for official levels plus custom map JSON import.
-- **Live progress** — best time, evaluations, current best path preview.
+- **Custom map browser** — browse/search the game's published levels (`discover`, `new`,
+  `popular`, `liked`, `by:username`), with thumbnails, plays/likes and one-click load.
+- **In-game leaderboard** per level — merge all three arrow boards (or filter to one),
+  searchable, with the real player/arrow/time columns.
+- **Replay viewer** — click any leaderboard run to fetch and simulate its exact inputs
+  with the game engine and play it back with play/pause/scrub/speed controls and the
+  run's real arrow sprite.
+- **Live search visualization** — while a search runs, the current best path streams
+  onto the map in real time (polled from the coordinator's best-symbol stream). The
+  ghost arrow **rides the best path in game-speed**, showing a bright trail of what it
+  covered and a faint "road ahead", with a live telemetry HUD (speed, input symbol,
+  thrust, tick/time).
+- **Learn from a run** — pick any leaderboard run ("Learn"), a saved own run, or import
+  a TAS `.json` file to use as a reference seed, then steer genetic/brute search with a
+  **run-influence** slider (free exploration → strictly following the reference).
+- **Search on custom maps** — imported/browsed custom levels appear in the search tab's
+  level picker, so all three modes run on them (fetch/cache on first load).
 - **Replayable "racing line"** — speed heatmap along the trail and brake-hold markers
   overlaid on the map.
-- **Run export** — copy base64 inputs or save a TAS JSON file compatible with the
-  reference site's TAS editor import shapes.
+- **Run export** — save a TAS JSON file (or copy base64 inputs) compatible with the
+  reference site's TAS editor import shapes; saved runs can be re-imported as learn seeds.
 
 ## Getting started
 

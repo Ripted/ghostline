@@ -127,6 +127,7 @@ export async function bruteSearch(
       rollouts: evaluations,
       bestTimeMs: best ? best.timeMs : null,
       bestFinishTick: best ? best.finishTick : null,
+      bestSymbols: best ? best.symbols.slice(0, 4000) : undefined,
     });
   }
 

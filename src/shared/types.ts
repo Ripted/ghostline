@@ -92,6 +92,57 @@ export interface LevelPack {
 
 export type SearchMode = "beam" | "genetic" | "brute";
 
+/** A run entry from `GET /leaderboard?levelId=...` (public). */
+export interface LeaderboardEntry {
+  run_id: number;
+  completion_time: number;
+  username: string;
+  arrow_name?: string;
+  created_at?: string;
+  replay_available?: number;
+  is_verifier?: boolean;
+}
+
+/** A published/custom level summary from `GET /published-levels`. */
+export interface PublishedLevel {
+  id?: string | number;
+  level_id?: string;
+  name?: string;
+  title?: string;
+  creator_name?: string;
+  author?: string;
+  username?: string;
+  plays?: number;
+  play_count?: number;
+  likes?: number;
+  like_count?: number;
+  worldRecord?: WorldRecordInfo | null;
+  world_record?: WorldRecordInfo | null;
+  runCount?: number;
+  map_name?: string;
+  data?: RawLevelData;
+}
+
+/** A level's world-record summary (snake_case returned by the API). */
+export interface WorldRecordInfo {
+  runId?: number;
+  run_id?: number;
+  completion_time?: number;
+  arrow_name?: string;
+  username?: string;
+}
+
+/** A replay payload from `GET /runs/{id}`. */
+export interface RunReplayPayload {
+  inputs?: string;
+  input_count?: number;
+  completion_time?: number;
+  mapName?: string;
+  level_id?: string;
+  arrow_name?: string;
+  skinConfig?: unknown;
+}
+
 export interface SearchParams {
   mode: SearchMode;
   levelId: string;
@@ -108,9 +159,18 @@ export interface SearchParams {
   rngSeed?: number;
   /** Seed run for genetic mode: base64 inputs (or null to require a source). */
   seedInputs?: string;
+  /** Symbol count in `seedInputs` (avoids decoding the zero-padded tail). */
+  seedInputCount?: number;
   seedArrowName?: string;
   /** Seed run's finish tick (tick count), used to report improvement. */
   seedFinishTick?: number | null;
+  /**
+   * How strongly the optimizer stays influenced by the reference run (0..1).
+   * Higher = mutations stay close to the reference and candidates that drift
+   * far from it are scored worse. Lower = the reference is just a starting
+   * point and the search explores more freely.
+   */
+  referenceInfluence?: number;
 }
 
 export interface ProgressUpdate {
