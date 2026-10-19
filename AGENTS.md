@@ -74,3 +74,17 @@ before the engine, applied as per-tick velocity deltas by the sim layer.
   from a 470-tick prefix; genetic from a non-finishing 300-tick thrust seed.
 - Official level IDs/names live in `nar-s/src/constants.ts` (`LEVELS`). `fetchLevelData` hits
   `api.narrowarrow.xyz/level-details/<id>?isCustomLevel=true`.
+
+## Desktop app (route-finder/) — search architecture
+- `Coordinator.run()` streams `ProgressSink` with `bestSymbols`; renderer polls `nf:getLivePath`
+  which re-simulates the best-symbol stream (downsampled ≤2000 pts) on demand. The ghost arrow
+  rides that path at game speed via a ref-based clock; a bright trail = covered, faint = road ahead.
+- "Learn from a run": reference seed flows `SearchParams.referenceInfluence` (0..1) →
+  `GeneticOptions.referenceInfluence` → `scopedMutate` (small local nudges when influence >0.6)
+  and a `symbolDrift` penalty (`refInfluence * drift * 4000` added to candidate score). Seeds
+  decode via `decodeInputsFromSeed(inputs, inputCount)` — **always pass inputCount** so the
+  zero-padded tail of the final base64 byte is trimmed (up to 3 phantom neutral ticks).
+- Saved runs export to JSON with `format: "narrow-route-finder/run"`; `nf:importRun` re-imports
+  those (or raw `SavedRun`/`SearchResult` shapes) as a learn seed. Custom/imported/browsed levels
+  are cached on disk under userData/levels and listed by `nf:listCachedLevels` so all three search
+  modes can run on them.
