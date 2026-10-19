@@ -24,6 +24,7 @@ import { decodeInputSymbols } from "../shared/codec.ts";
 import {
   cacheLevel,
   deleteRun,
+  listCachedLevels,
   listRuns,
   readCachedLevel,
   saveRun,
@@ -50,6 +51,63 @@ export function registerIpc() {
   // ---- Level catalog ------------------------------------------------------
   ipcMain.handle("nf:listLevels", () => LEVELS);
   ipcMain.handle("nf:listPacks", () => LEVEL_PACKS);
+  ipcMain.handle("nf:listCachedLevels", () => listCachedLevels());
+
+  // ---- Import a saved run/TAS file (use as a reference seed) -------------
+  ipcMain.handle(
+    "nf:importRun",
+    async (): Promise<{
+      inputs: string;
+      inputCount: number;
+      symbols: number[];
+      arrowName: string;
+      levelName?: string;
+      finishTimeS?: number | null;
+    } | null> => {
+      const result = await dialog.showOpenDialog({
+        title: "Import a saved run / TAS file (.json)",
+        properties: ["openFile"],
+        filters: [
+          { name: "Narrow Route JSON (TAS / saved run)", extensions: ["json"] },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (result.canceled || result.filePaths.length === 0) return null;
+      const text = await readFile(result.filePaths[0], "utf8");
+      const doc = JSON.parse(text) as Record<string, unknown>;
+      // Accept: the app's export doc, or a raw SavedRun / SearchResult shape.
+      const inputs = typeof doc.inputs === "string" ? doc.inputs : undefined;
+      const symbols = Array.isArray(doc.symbols) ? (doc.symbols as number[]) : undefined;
+      const arrowName =
+        (typeof doc.arrow_name === "string" && doc.arrow_name) ||
+        (typeof doc.arrowName === "string" && doc.arrowName) ||
+        "Narrow Arrow";
+      const levelName =
+        (typeof doc.level_name === "string" && doc.level_name) ||
+        (typeof doc.levelName === "string" && doc.levelName) ||
+        undefined;
+      const finishTimeS =
+        typeof doc.finish_time_s === "number"
+          ? doc.finish_time_s
+          : typeof doc.timeMs === "number"
+            ? doc.timeMs / 1000
+            : null;
+      if (!inputs && !symbols) {
+        throw new Error("No inputs or symbols found in this file.");
+      }
+      return {
+        inputs: inputs ?? "",
+        inputCount:
+          typeof doc.input_count === "number"
+            ? doc.input_count
+            : (symbols?.length ?? 0),
+        symbols: symbols ?? (inputs ? decodeInputSymbols(inputs) : []),
+        arrowName,
+        levelName,
+        finishTimeS,
+      };
+    },
+  );
 
   // ---- Level data (fetch + cache) ----------------------------------------
   ipcMain.handle("nf:getLevelInfo", (_e, id: string): LevelInfo | null => {

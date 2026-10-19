@@ -7,7 +7,7 @@ import { beamSearch } from "./beam.ts";
 import { geneticOptimize } from "./optimize.ts";
 import { bruteSearch } from "./brute.ts";
 import { simulateRunExact } from "./engine.ts";
-import { encodeInputSymbols } from "../../shared/codec.ts";
+import { decodeInputSymbols, encodeInputSymbols } from "../../shared/codec.ts";
 import type { RawLevelData, SearchParams, SearchResult } from "../../shared/types.ts";
 import type { RolloutEvaluator, ProgressSink } from "./types.ts";
 import { levelName } from "../../shared/levels.ts";
@@ -110,7 +110,7 @@ export class Coordinator {
         case "genetic": {
           // Seed from the caller's inputs, if provided.
           const seedSymbols = params.seedInputs
-            ? decodeInputsFromSeed(params.seedInputs)
+            ? decodeInputsFromSeed(params.seedInputs, params.seedInputCount)
             : undefined;
           if (!seedSymbols || seedSymbols.length === 0) {
             throw new Error("Genetic mode needs a seed run (import one or run Beam/Brute first).");
@@ -127,6 +127,7 @@ export class Coordinator {
               rngSeed,
               useCrossover: true,
               eliteCount: 4,
+              referenceInfluence: params.referenceInfluence ?? 0.5,
             },
             sink,
           );
@@ -138,7 +139,7 @@ export class Coordinator {
           break;
         }
         case "brute": {
-          const prefix = params.seedInputs ? decodeInputsFromSeed(params.seedInputs) : [];
+          const prefix = params.seedInputs ? decodeInputsFromSeed(params.seedInputs, params.seedInputCount) : [];
           const res = await bruteSearch(
             evaluator,
             {
@@ -207,24 +208,13 @@ export class Coordinator {
   }
 }
 
-/** Decode a seed from base64 inputs or a raw symbol list (for the UI). */
-export function decodeInputsFromSeed(inputs: string): number[] {
+/** Decode a seed from base64 inputs (honoring the symbol count). */
+export function decodeInputsFromSeed(inputs: string, inputCount?: number): number[] {
   if (!inputs) return [];
-  // If it's base64 inputs, decode; otherwise it may be a JSON number array.
   try {
-    return decodeInputSymbolsCompat(inputs);
+    // Trims the zero-padded tail of the final byte when a count is known.
+    return decodeInputSymbols(inputs, inputCount);
   } catch {
     return [];
   }
-}
-
-function decodeInputSymbolsCompat(inputs: string): number[] {
-  // Reuse the shared codec (browser-safe atob unavailable in main; use Buffer).
-  const binary = Buffer.from(inputs, "base64").toString("binary");
-  const symbols: number[] = [];
-  for (let i = 0; i < binary.length; i++) {
-    const byte = binary.charCodeAt(i);
-    symbols.push((byte >> 6) & 3, (byte >> 4) & 3, (byte >> 2) & 3, byte & 3);
-  }
-  return symbols;
 }

@@ -23,16 +23,19 @@ interface LeaderboardPanelProps {
   arrowFilter?: string;
   deep?: boolean;
   onOpenReplay?: (sel: ReplaySelection) => void;
+  /** Request a run's inputs be used as a reference seed (learn-from-run). */
+  onUseAsReference?: (sel: ReplaySelection) => void;
 }
 
 const ARROW_LABELS = ["All arrows", "Narrow Arrow", "Speedy Arrow", "Energy Arrow"];
 
-export function LeaderboardPanel({ levelId, arrowFilter = "all", deep = false, onOpenReplay }: LeaderboardPanelProps) {
+export function LeaderboardPanel({ levelId, arrowFilter = "all", deep = false, onOpenReplay, onUseAsReference }: LeaderboardPanelProps) {
   const [entries, setEntries] = useState<LeaderboardEntry[] | null>(null);
   const [arrow, setArrow] = useState(arrowFilter);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState<number | null>(null);
+  const [seeding, setSeeding] = useState<number | null>(null);
 
   const load = useCallback(async (id: string, filter: string) => {
     if (!id) return;
@@ -74,6 +77,28 @@ export function LeaderboardPanel({ levelId, arrowFilter = "all", deep = false, o
       setError(`Couldn't load replay: ${err instanceof Error ? err.message : err}`);
     } finally {
       setOpening(null);
+    }
+  };
+
+  const useAsReference = async (entry: LeaderboardEntry) => {
+    if (!onUseAsReference) return;
+    setSeeding(entry.run_id);
+    try {
+      const payload = await window.nf.getRunReplay(entry.run_id);
+      const sel: ReplaySelection = {
+        runId: entry.run_id,
+        username: entry.username,
+        timeS: entry.completion_time,
+        arrowName: payload.arrow_name ?? entry.arrow_name ?? "Narrow Arrow",
+        inputs: payload.inputs ?? "",
+        inputCount: payload.input_count ?? 0,
+        levelId,
+      };
+      onUseAsReference(sel);
+    } catch (err) {
+      setError(`Couldn't load replay: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setSeeding(null);
     }
   };
 
@@ -134,6 +159,14 @@ export function LeaderboardPanel({ levelId, arrowFilter = "all", deep = false, o
                     disabled={!e.replay_available || opening === e.run_id}
                   >
                     {opening === e.run_id ? "…" : e.replay_available ? "Replay" : "—"}
+                  </button>
+                  <button
+                    style={{ ...smallButtonStyle, color: "#d29922" }}
+                    onClick={() => void useAsReference(e)}
+                    disabled={seeding === e.run_id}
+                    title="Use this run as a reference seed to learn from"
+                  >
+                    {seeding === e.run_id ? "…" : "Learn"}
                   </button>
                 </td>
               </tr>

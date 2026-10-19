@@ -22,6 +22,12 @@ export interface GeneticOptions {
   /** When 0, pop = active and no crossover between distinct genomes. */
   useCrossover: boolean;
   eliteCount: number;
+  /**
+   * 0..1 — how strongly candidates are tied to the reference run. At 1.0,
+   * mutations stay small and any candidate that drifts far from the reference
+   * symbol stream is penalized; at 0.0 the search freely explores.
+   */
+  referenceInfluence: number;
 }
 
 interface Segment {
@@ -49,6 +55,7 @@ const DEFAULT_OPTS: GeneticOptions = {
   rngSeed: 1,
   useCrossover: true,
   eliteCount: 4,
+  referenceInfluence: 0.5,
 };
 
 /** Run-length encode a flat symbol stream. */
@@ -98,6 +105,88 @@ function makeRng(seed: number): () => number {
     // `>>> 0` keeps the result unsigned so every value lands in [0, 1).
     return (z >>> 0) / 4294967296;
   };
+}
+
+/**
+ * Fraction of positions where `a` and `b` differ (0 = identical, 1 = totally
+ * different). Cheap LCS-free proxy for "how much has this drifted".
+ */
+export function symbolDrift(a: number[], b: number[]): number {
+  const n = Math.max(a.length, b.length, 1);
+  let diff = 0;
+  for (let i = 0; i < n; i++) {
+    if ((a[i] ?? -1) !== (b[i] ?? -1)) diff++;
+  }
+  return diff / n;
+}
+
+/**
+ * When referenceInfluence is high, mutations should stay close to the
+ * reference: nudge symbols (+/-1 within alphabet) rather than replacing with a
+ * random symbol, and use smaller length changes. Returns a copy so the parent
+ * is never mutated in place.
+ */
+function scopedMutate(segs: Segment[], rnd: () => number, influence: number): Segment[] {
+  const s = segs.map((x) => ({ ...x }));
+  const r = (n: number) => Math.floor(rnd() * n);
+  const pick = (a: number[]) => a[r(a.length)];
+  if (s.length === 0) {
+    s.push({ symbol: 0, length: 1 });
+    return s;
+  }
+  if (s.length < 2) {
+    // Nudge the single segment's symbol by +/-1 (keeping 0..3), or grow it.
+    if (rnd() < 0.6 && s[0].symbol !== 3) s[0].symbol += 1;
+    else if (s[0].symbol !== 0) s[0].symbol -= 1;
+    else s[0].length = Math.max(1, s[0].length + (r(2) ? 1 : -1));
+    return normalise(s);
+  }
+  const m = r(6);
+  const b = 1 + r(s.length - 1);
+  if (m === 0) {
+    // Shift a small number of ticks between neighbours.
+    const dl = (r(2) ? 1 : -1) * (1 + Math.floor(rnd() * Math.max(1, influence * 24)));
+    if (dl > 0) {
+      if (s[b].length > dl) {
+        s[b - 1].length += dl;
+        s[b].length -= dl;
+      }
+    } else {
+      const dd = -dl;
+      if (s[b - 1].length > dd) {
+        s[b - 1].length -= dd;
+        s[b].length += dd;
+      }
+    }
+  } else if (m === 1) {
+    // Nudge a symbol rather than a random swap.
+    const i = r(s.length);
+    const dir = r(2) ? 1 : -1;
+    const next = s[i].symbol + dir;
+    if (next >= 0 && next <= 3) s[i].symbol = next;
+  } else if (m === 2) {
+    // Small insert/delete near the reference length.
+    if (r(2)) s.push({ symbol: 0, length: 1 + r(Math.max(1, Math.floor(influence * 12))) });
+    else if (s.length > 1) s.splice(r(s.length), 1);
+  } else if (m === 3) {
+    // Local boundary drift (like the coordinate-descent but in-mutation).
+    const i = r(s.length);
+    if (s[i].length > 1) {
+      const cut = 1;
+      s.splice(i, 1, { symbol: s[i].symbol, length: cut }, { symbol: pick([0, 3]), length: s[i].length - cut });
+    }
+  } else if (m === 4) {
+    const i = r(s.length);
+    s[i].length = Math.max(1, s[i].length + (r(2) ? 1 : -1) * (1 + r(Math.max(1, Math.floor(influence * 20)))));
+  } else {
+    const i = r(s.length - 1);
+    const move = Math.max(1, Math.floor(rnd() * influence * 24 + 1));
+    if (s[i].length > move) {
+      s[i].length -= move;
+      s[i + 1].length += move;
+    }
+  }
+  return normalise(s);
 }
 
 /** One simple local edit in place (port of tas-brute's mutate/simpleMutate). */
@@ -242,11 +331,13 @@ export async function geneticOptimize(
       }
       let segs = toSegs(parent);
       if (rnd() < o.mutationRate || i === 0) {
-        segs = simpleMutate(segs, rnd, true);
+        // High influence: small local nudges around the reference; otherwise
+        // the original coarser mutations.
+        segs = o.referenceInfluence > 0.6 ? scopedMutate(segs, rnd, o.referenceInfluence) : simpleMutate(segs, rnd, true);
         segs = normalise(segs);
         // Occasionally a second mutation for variety.
         if (rnd() < 0.25) {
-          segs = simpleMutate(segs, rnd, true);
+          segs = o.referenceInfluence > 0.6 ? scopedMutate(segs, rnd, o.referenceInfluence) : simpleMutate(segs, rnd, true);
           segs = normalise(segs);
         }
       }
@@ -263,7 +354,13 @@ export async function geneticOptimize(
       const out = outcomes[i];
       if (!out) continue;
       const finish = out.code === 1 && out.finishTick != null;
-      const score = finish ? (out.finishTick as number) : 1e8 - (out.progress ?? 0) * 50;
+      let score = finish ? (out.finishTick as number) : 1e8 - (out.progress ?? 0) * 50;
+      // High reference influence penalizes candidates that drifted far from the
+      // reference stream (keeps the search in the run's local optimum region).
+      if (o.referenceInfluence > 0) {
+        const drift = symbolDrift(next[i], seedFlat);
+        score += Math.floor(o.referenceInfluence * drift * 4000);
+      }
       scored.push({ flat: next[i], score, finishTick: finish ? out.finishTick : null });
     }
     if (scored.length === 0) {

@@ -159,9 +159,18 @@ export interface SearchParams {
   rngSeed?: number;
   /** Seed run for genetic mode: base64 inputs (or null to require a source). */
   seedInputs?: string;
+  /** Symbol count in `seedInputs` (avoids decoding the zero-padded tail). */
+  seedInputCount?: number;
   seedArrowName?: string;
   /** Seed run's finish tick (tick count), used to report improvement. */
   seedFinishTick?: number | null;
+  /**
+   * How strongly the optimizer stays influenced by the reference run (0..1).
+   * Higher = mutations stay close to the reference and candidates that drift
+   * far from it are scored worse. Lower = the reference is just a starting
+   * point and the search explores more freely.
+   */
+  referenceInfluence?: number;
 }
 
 export interface ProgressUpdate {

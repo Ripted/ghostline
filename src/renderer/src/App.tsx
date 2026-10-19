@@ -59,6 +59,17 @@ export default function App() {
   const [actionTicks, setActionTicks] = useState(4);
   const [maxCandidates, setMaxCandidates] = useState(50_000);
   const [bruteSeedInputs, setBruteSeedInputs] = useState("");
+  // Custom (cached/imported) levels shown alongside the official catalog.
+  const [customLevels, setCustomLevels] = useState<Array<{ id: string; name: string; custom: boolean }>>([]);
+  // Learn-from-run: a reference seed + how strongly to stay influenced by it.
+  const [reference, setReference] = useState<{
+    inputs: string;
+    inputCount: number;
+    arrowName: string;
+    finishTick: number | null;
+    label: string;
+  } | null>(null);
+  const [influence, setInfluence] = useState(0.5);
   // Playback.
   const [playing, setPlaying] = useState(false);
   const [playbackTick, setPlaybackTick] = useState(0);
@@ -105,6 +116,7 @@ export default function App() {
     } catch {
       /* non-fatal */
     }
+    void window.nf.listCachedLevels().then(setCustomLevels).catch(() => {});
   }, []);
 
   // Progress + result subscription.
@@ -145,21 +157,31 @@ export default function App() {
     return unsub;
   }, [refreshRuns]);
 
-  // Live search preview: poll the active search's best path at ~8 Hz.
+  // Live search preview: poll the active search's best path at ~8 Hz and let
+  // the ghost arrow ride the best-so-far path in real time.
   useEffect(() => {
     if (!activeSearch) {
       if (liveTimerRef.current) {
         clearInterval(liveTimerRef.current);
         liveTimerRef.current = null;
       }
+      setLiveTick(null);
       return;
     }
+    let lastLen = 0;
     liveTimerRef.current = setInterval(() => {
       void window.nf
         .getLivePath()
         .then((snap: LivePathSnapshot | null) => {
           if (!snap) return;
-          if (snap.path && snap.path.length) {
+          if (snap.path && snap.path.length > 0) {
+            // New best path may be longer or a completely new route — restart
+            // the ghost if the path changed shape dramatically.
+            if (Math.abs(snap.path.length - lastLen) > snap.path.length * 0.5) {
+              setLiveTick(null);
+              ghostClockRef.current = { tick: 0, at: 0 };
+            }
+            lastLen = snap.path.length;
             setLivePath(snap.path);
           }
         })
@@ -170,6 +192,31 @@ export default function App() {
       liveTimerRef.current = null;
     };
   }, [activeSearch]);
+
+  // Ghost playback: advance liveTick at game speed (240 ticks/s) while the
+  // search runs, looping so the arrow keeps riding the best-so-far path.
+  // Uses a ref-based clock so the loop doesn't reset every tick.
+  const ghostClockRef = useRef<{ tick: number; at: number }>({ tick: 0, at: 0 });
+  useEffect(() => {
+    if (!activeSearch || playing) {
+      ghostClockRef.current = { tick: liveTick ?? 0, at: 0 };
+      return;
+    }
+    if (!livePath || livePath.length < 2) return;
+    let frame: number;
+    // Reset only when starting a fresh ghost session (new path version).
+    if (ghostClockRef.current.at === 0) {
+      ghostClockRef.current = { tick: 0, at: Date.now() };
+    }
+    const step = () => {
+      const elapsedTicks = Math.floor((Date.now() - ghostClockRef.current.at) / (1000 / 240));
+      const current = (ghostClockRef.current.tick + elapsedTicks) % Math.max(1, livePath.length);
+      setLiveTick(current);
+      frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, [activeSearch, playing, livePath]);
 
   // Playback tick loop.
   useEffect(() => {
@@ -199,9 +246,17 @@ export default function App() {
   }, [playing, playbackSpeed, replayPath, path]);
 
   const filteredLevels = useMemo(() => {
-    if (selectedPack === "all") return levels;
-    return levels.filter((l) => l.packId === selectedPack);
-  }, [levels, selectedPack]);
+    const base = selectedPack === "all" ? levels : levels.filter((l) => l.packId === selectedPack);
+    // Custom imported/browsed levels appear alongside the official catalog.
+    if (selectedPack === "all" && customLevels.length > 0) {
+      const official = new Set(base.map((l) => l.id));
+      return [
+        ...customLevels.filter((c) => !official.has(c.id)).map((c) => ({ id: c.id, name: `${c.name}${c.custom ? " (custom)" : ""}`, gameOrder: 0, packId: "custom" })),
+        ...base,
+      ];
+    }
+    return base;
+  }, [levels, customLevels, selectedPack]);
 
   const startSearch = async () => {
     if (activeSearchRef.current) return;
@@ -217,20 +272,34 @@ export default function App() {
     setPlaying(false);
     setProgress({ ...emptyProgress, message: "Starting search…", done: false });
 
+    // Resolve the reference seed: an explicitly learned run wins over the
+    // manual base64 textareas (which remain as a fallback).
+    const refInputs = reference?.inputs ?? seedInputs ?? bruteSeedInputs;
+    const refFinishTicks = reference?.finishTick ?? null;
+    const refArrow = reference?.arrowName ?? arrow;
+    const refCount = reference?.inputCount;
     const params: SearchParams = {
       mode,
       levelId: selectedLevelId,
-      arrowName: arrow,
+      // Learning from a run: match the reference's arrow so the seed's physics
+      // line up with the search.
+      arrowName: reference?.arrowName ?? arrow,
       budgetSec,
       rngSeed: 1,
+      referenceInfluence: influence,
       ...(mode === "beam"
-        ? { beamWidth, actionRepeat, seedInputs: seedInputs || undefined }
+        ? { beamWidth, actionRepeat }
         : {}),
-      ...(mode === "genetic"
-        ? { seedInputs: seedInputs || undefined }
+      ...(mode === "genetic" || mode === "brute"
+        ? {
+            seedInputs: refInputs || undefined,
+            seedInputCount: refCount,
+            seedArrowName: refArrow,
+            seedFinishTick: refFinishTicks,
+          }
         : {}),
       ...(mode === "brute"
-        ? { actionTicks, maxCandidates, seedInputs: bruteSeedInputs || undefined }
+        ? { actionTicks, maxCandidates }
         : {}),
     };
     try {
@@ -273,6 +342,48 @@ export default function App() {
       setError(String(err instanceof Error ? err.message : err));
     }
   };
+
+  /** Set a leaderboard run as the reference seed (learn from it). */
+  const useAsReference = async (sel: ReplaySelection) => {
+    const finishTick =
+      sel.timeS != null ? Math.max(0, Math.round(sel.timeS * 240)) : null;
+    setReference({
+      inputs: sel.inputs,
+      inputCount: sel.inputCount,
+      arrowName: sel.arrowName,
+      finishTick,
+      label: `${sel.username} (${sel.arrowName} · ${sel.timeS != null ? sel.timeS.toFixed(3) : "?"}s)`,
+    });
+    // The seed's inputs only make sense on the level they were driven on, so
+    // switch to that level and load its geometry.
+    if (sel.levelId && sel.levelId !== selectedLevelId) {
+      setSelectedLevelId(sel.levelId);
+      await loadLevel(sel.levelId);
+    }
+    setError(null);
+    setActiveTab("search");
+  };
+
+  /** Import a saved TAS/run file as the reference seed. */
+  const importRunAsReference = async () => {
+    try {
+      const seed = await window.nf.importRun();
+      if (!seed) return;
+      const finT = seed.finishTimeS != null ? Math.round(seed.finishTimeS * 240) : null;
+      setReference({
+        inputs: seed.inputs || "",
+        inputCount: seed.inputCount,
+        arrowName: seed.arrowName,
+        finishTick: finT,
+        label: `${seed.levelName ?? "Imported run"} (${seed.arrowName} · ${seed.finishTimeS != null ? seed.finishTimeS.toFixed(3) : "?"}s)`,
+      });
+      setError(null);
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  const clearReference = () => setReference(null);
 
   const bestTimeMs = progress.done && progress.bestTimeMs != null ? progress.bestTimeMs : null;
 
@@ -364,6 +475,7 @@ export default function App() {
             levelId={selectedLevelId}
             deep
             onOpenReplay={(sel) => void openLeaderboardReplay(sel)}
+            onUseAsReference={useAsReference}
           />
         ) : activeTab === "custom" ? (
           <CustomMapBrowser onOpenLevel={(sel) => void openCustomLevel(sel)} />
@@ -445,12 +557,49 @@ export default function App() {
               </>
             )}
 
-            {mode === "genetic" && (
+            {(mode === "genetic" || mode === "brute") && reference && (
+              <div style={{ background: "rgba(210,153,34,0.1)", border: "1px solid rgba(210,153,34,0.35)", borderRadius: 8, padding: 8 }}>
+                <div style={{ fontSize: 11, color: "#d29922", marginBottom: 4 }}>
+                  Learning from: <b>{reference.label}</b>
+                </div>
+                <div style={{ fontSize: 11, color: "#9aa4b2", marginBottom: 6 }}>
+                  {reference.inputCount.toLocaleString()} inputs
+                  {reference.finishTick != null ? ` · finishes @ ${(reference.finishTick / 240).toFixed(3)}s` : " · no finish info"}
+                </div>
+                <label style={{ ...labelStyle, gap: 2 }}>
+                  <span style={{ fontSize: 11 }}>
+                    Run influence <b style={{ color: "#e6edf3" }}>{(influence * 100).toFixed(0)}%</b>
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(influence * 100)}
+                    onChange={(e) => setInfluence(Number(e.target.value) / 100)}
+                    style={{ width: "100%", accentColor: "#d29922" }}
+                  />
+                  <span style={{ fontSize: 10, color: "#7d8590" }}>
+                    <span style={{ float: "left" }}>free</span>
+                    <span style={{ float: "right" }}>strictly follow run</span>
+                  </span>
+                </label>
+                <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                  <button style={smallButtonStyle} onClick={() => void importRunAsReference()}>
+                    Import run…
+                  </button>
+                  <button style={smallButtonStyle} onClick={clearReference}>
+                    Clear
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {mode === "genetic" && !reference && (
               <label style={labelStyle}>
                 Seed run (base64 inputs)
                 <textarea
                   style={{ ...inputStyle, height: 60, resize: "vertical", fontFamily: "monospace" }}
-                  placeholder="Paste a known input base64 to polish"
+                  placeholder="Use the Leaderboard's 'Learn' on a run, import a run, or paste base64 here"
                   value={seedInputs}
                   onChange={(e) => setSeedInputs(e.target.value)}
                 />
@@ -481,15 +630,17 @@ export default function App() {
                     onChange={(e) => setMaxCandidates(Math.max(100, Number(e.target.value)))}
                   />
                 </label>
-                <label style={labelStyle}>
-                  Seed prefix (base64, optional)
-                  <textarea
-                    style={{ ...inputStyle, height: 50, resize: "vertical", fontFamily: "monospace" }}
-                    placeholder="Start from a known prefix"
-                    value={bruteSeedInputs}
-                    onChange={(e) => setBruteSeedInputs(e.target.value)}
-                  />
-                </label>
+                {!reference && (
+                  <label style={labelStyle}>
+                    Seed prefix (base64, optional)
+                    <textarea
+                      style={{ ...inputStyle, height: 50, resize: "vertical", fontFamily: "monospace" }}
+                      placeholder="Start from a known prefix"
+                      value={bruteSeedInputs}
+                      onChange={(e) => setBruteSeedInputs(e.target.value)}
+                    />
+                  </label>
+                )}
               </>
             )}
 
@@ -573,6 +724,31 @@ export default function App() {
                 <LegendDot color="rgba(80,220,120,0.22)" label="zone" />
                 <LegendDot color="rgba(180,90,255,0.9)" label="portal" />
               </div>
+
+              {/* Live search HUD: telemetry of the ghost riding the best-so-far path */}
+              {activeSearch && !playing && livePath && livePath.length > 0 && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: 8,
+                    left: 10,
+                    background: "rgba(13,17,23,0.82)",
+                    border: "1px solid rgba(157,141,255,0.35)",
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    fontSize: 11,
+                    fontFamily: "ui-monospace, 'Cascadia Mono', monospace",
+                    lineHeight: 1.5,
+                    color: "#c9d1d9",
+                    pointerEvents: "none",
+                  }}
+                >
+                  <div style={{ color: "#9d8dff", fontWeight: 700, marginBottom: 2 }}>
+                    🔎 LIVE SEARCH · {arrow}
+                  </div>
+                  <LiveHud path={livePath} tick={liveTick} />
+                </div>
+              )}
             </>
           ) : (
             <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
@@ -692,6 +868,21 @@ export default function App() {
                       Export
                     </button>
                     <button
+                      style={{ ...smallButtonStyle, color: "#d29922" }}
+                      onClick={() =>
+                        setReference({
+                          inputs: run.inputs,
+                          inputCount: run.inputCount ?? run.symbols.length,
+                          arrowName: run.arrowName,
+                          finishTick: run.finishTick ?? null,
+                          label: `${run.levelName} (${run.arrowName} · ${run.timeMs != null ? (run.timeMs / 1000).toFixed(3) : "?"}s)`,
+                        })
+                      }
+                      title="Use this saved run as a reference seed to learn from"
+                    >
+                      Learn
+                    </button>
+                    <button
                       style={smallButtonStyle}
                       onClick={() => {
                         setPath(run.path);
@@ -716,6 +907,53 @@ export default function App() {
           Physics engine: Narrow Arrow Rust/WASM @ 240Hz · deterministic seeded search · live progress from worker pool
         </div>
       </main>
+    </div>
+  );
+}
+
+/** Small live telemetry readout for the ghost arrow riding a search path. */
+function LiveHud({ path, tick }: { path: SearchResult["path"]; tick: number | null }) {
+  const i = tick != null ? Math.min(Math.max(0, Math.round(tick)), Math.max(0, path.length - 1)) : null;
+  const t = i ?? 0;
+  const p = path[t];
+  const prev = path[Math.max(0, t - 1)];
+  const isCoast = p && (p.input ?? 0) === 0;
+  const isBrake = p && (p.input ?? 0) === 3;
+  const dx = p && prev ? p.x - prev.x : 0;
+  const dy = p && prev ? p.y - prev.y : 0;
+  const speed = Math.hypot(dx, dy) * 240; // px per tick -> px/s
+
+  const inputName =
+    p && p.input != null
+      ? p.input === 0
+        ? "coast"
+        : p.input === 1
+          ? "right"
+          : p.input === 2
+            ? "left"
+            : "brake"
+      : "—";
+
+  return (
+    <div>
+      <div>
+        <span style={{ color: "#7d8590" }}>tick </span>
+        <span style={{ color: "#e6edf3" }}>{(t / 240).toFixed(3)}s</span>
+        <span style={{ color: "#7d8590" }}> / {(path.length / 240).toFixed(2)}s</span>
+      </div>
+      <div>
+        <span style={{ color: "#7d8590" }}>speed </span>
+        <span style={{ color: "#7ad4ff" }}>{speed.toFixed(0)} px/s</span>
+      </div>
+      <div>
+        <span style={{ color: "#7d8590" }}>input </span>
+        <span style={{ color: isBrake ? "#f472b6" : isCoast ? "#9aa4b2" : "#e6edf3" }}>{inputName}</span>
+        {p?.thrustPower === 1 ? (
+          <span style={{ color: "#3fb950" }}> · thrust</span>
+        ) : p?.thrustPower === 0 ? (
+          <span style={{ color: "#9aa4b2" }}> · off</span>
+        ) : null}
+      </div>
     </div>
   );
 }

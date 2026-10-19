@@ -6,6 +6,7 @@ import { app } from "electron";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RawLevelData, SearchResult } from "../../shared/types.ts";
+import { LEVELS } from "../../shared/levels.ts";
 
 export interface SavedRun extends SearchResult {
   id: string;
@@ -77,7 +78,28 @@ export function isLevelCacheFresh(level: CachedLevel): boolean {
   return Date.now() - level.fetchedAt < LEVEL_TTL_MS;
 }
 
-// ---- Saved runs -----------------------------------------------------------
+/** List all levels currently in the geometry cache (incl. custom imports). */
+export function listCachedLevels(): Array<{ id: string; name: string; custom: boolean }> {
+  try {
+    const dir = join(root(), "levels");
+    const official = new Set(LEVELS.map((l) => l.id));
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => {
+        try {
+          const parsed = JSON.parse(readFileSync(join(dir, f), "utf8")) as CachedLevel;
+          if (!parsed?.id || !parsed?.data?.obstacles) return null;
+          return { id: parsed.id, name: parsed.name ?? parsed.id, custom: !official.has(parsed.id) };
+        } catch {
+          return null;
+        }
+      })
+      .filter((x): x is { id: string; name: string; custom: boolean } => x !== null)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
 
 export function listRuns(): SavedRun[] {
   try {

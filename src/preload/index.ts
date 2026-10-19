@@ -36,9 +36,21 @@ export interface SearchProgressEvent {
   result?: SearchResult;
 }
 
+export interface ImportedRunSeed {
+  inputs: string;
+  inputCount: number;
+  symbols: number[];
+  arrowName: string;
+  levelName?: string;
+  finishTimeS?: number | null;
+}
+
 export interface NfApi {
   listLevels(): Promise<LevelInfo[]>;
   listPacks(): Promise<LevelPack[]>;
+  listCachedLevels(): Promise<Array<{ id: string; name: string; custom: boolean }>>;
+  /** Import a saved TAS/run JSON for use as a reference seed. */
+  importRun(): Promise<ImportedRunSeed | null>;
   getLevelInfo(id: string): Promise<LevelInfo | null>;
   getLevelData(id: string): Promise<LevelGeometryPayload>;
   importCustomMap(): Promise<{ levelId: string; name: string; geometry: LevelGeometryPayload["geometry"] }>;
@@ -75,6 +87,8 @@ export interface NfApi {
 const api: NfApi = {
   listLevels: () => ipcRenderer.invoke("nf:listLevels"),
   listPacks: () => ipcRenderer.invoke("nf:listPacks"),
+  listCachedLevels: () => ipcRenderer.invoke("nf:listCachedLevels"),
+  importRun: () => ipcRenderer.invoke("nf:importRun"),
   getLevelInfo: (id) => ipcRenderer.invoke("nf:getLevelInfo", id),
   getLevelData: (id) => ipcRenderer.invoke("nf:getLevelData", id),
   importCustomMap: () => ipcRenderer.invoke("nf:importCustomMap"),

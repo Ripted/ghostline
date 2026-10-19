@@ -194,14 +194,32 @@ export function ReplayStage({
       }
     }
 
-    // Live search path (thinner, translucent purple beats the racing line).
+    // Live search ghost: the part already "played" is a bright trail, the
+    // remaining best-so-far path is faint (the road ahead).
     if (live && live.length >= 2) {
-      ctx.lineWidth = 1.8;
+      const played = lti != null && lti >= 0 ? Math.min(live.length - 1, lti) : live.length - 1;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      ctx.strokeStyle = "rgba(157, 141, 255, 0.55)";
+
+      // Road ahead (faint).
+      if (played + 1 < live.length) {
+        ctx.lineWidth = 1.6;
+        ctx.strokeStyle = "rgba(157, 141, 255, 0.22)";
+        ctx.beginPath();
+        for (let i = played; i < live.length; i++) {
+          if (i === 0) ctx.moveTo(X(live[i].x), Y(live[i].y));
+          else ctx.lineTo(X(live[i].x), Y(live[i].y));
+        }
+        ctx.stroke();
+      }
+
+      // Trail (bright, what the ghost already covered).
+      ctx.lineWidth = 2.4;
+      ctx.strokeStyle = "rgba(157, 141, 255, 0.85)";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
       ctx.beginPath();
-      for (let i = 0; i < live.length; i++) {
+      for (let i = 0; i <= played && i < live.length; i++) {
         if (i === 0) ctx.moveTo(X(live[i].x), Y(live[i].y));
         else ctx.lineTo(X(live[i].x), Y(live[i].y));
       }
