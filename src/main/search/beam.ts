@@ -62,6 +62,11 @@ export async function beamSearch(
   let evaluations = 0;
   let generations = 0;
   let nodesExplored = 0;
+  let lastProgress = 0;
+  // Last live-preview best we published. `bestSymbols` is only sent when this
+  // genuinely improves (a faster finish, or further progress before any
+  // finish), so the renderer's ghost updates on new bests instead of every gen.
+  let publishedBest: { symbols: number[]; finishTick: number | null; progress: number } | null = null;
 
   const deadline = o.budgetMs > 0 ? start + o.budgetMs : Infinity;
 
@@ -139,15 +144,43 @@ export async function beamSearch(
     beam = nextNodes.filter((n) => !n.dead).slice(0, o.beamWidth);
 
     generations++;
-    progress?.({
-      message: `Beam gen ${generations}: ${beam.length} nodes, best ${best ? (best.timeMs / 1000).toFixed(3) + "s" : "not yet"}`,
-      evaluations,
-      generations,
-      rollouts: evaluations,
-      bestTimeMs: best ? best.timeMs : null,
-      bestFinishTick: best ? best.finishTick : null,
-      bestSymbols: best ? best.symbols.slice(0, 4000) : undefined,
-    });
+
+    // Publish at most every ~75ms so the IPC event bus and renderer aren't
+    // flooded when generations are cheap; a search that stalls for a while
+    // still publishes once more at completion via the final eval.
+    // During discovery (no finish yet) the furthermost node is the live "best";
+    // once a finish exists, only a faster finish is a new best. `bestSymbols`
+    // is only carried when it's a genuine new best — the coordinator (and the
+    // renderer) key the live path off that signal, so a heartbeat re-slicing
+    // the same stream would defeat the IPC cache and re-sim every poll.
+    // beam is kept sorted (finished then progress desc) by the re-sort above,
+    // so beam[0] is the best surviving node for the discovery preview.
+    const previewBase = best ?? (beam.length > 0 ? beam[0] : null);
+    let isNewBest = false;
+    if (previewBase) {
+      const finish = previewBase.finishTick;
+      const prog = previewBase.progress;
+      isNewBest =
+        !publishedBest ||
+        (finish != null && (publishedBest.finishTick == null || finish < publishedBest.finishTick)) ||
+        (finish == null && publishedBest.finishTick == null && prog > publishedBest.progress);
+      if (isNewBest) {
+        publishedBest = { symbols: previewBase.symbols, finishTick: finish, progress: prog };
+      }
+    }
+    const now = Date.now();
+    if (now - lastProgress >= 75 || isNewBest) {
+      lastProgress = now;
+      progress?.({
+        message: `Beam gen ${generations}: ${beam.length} nodes, best ${best ? (best.timeMs / 1000).toFixed(3) + "s" : "not yet"}`,
+        evaluations,
+        generations,
+        rollouts: evaluations,
+        bestTimeMs: best ? best.timeMs : null,
+        bestFinishTick: best ? best.finishTick : null,
+        bestSymbols: isNewBest && publishedBest ? publishedBest.symbols.slice() : undefined,
+      });
+    }
 
     // If every expanded node died / finished no progress made a finishing run would require expansion.
     if (beam.length === 0 && !best) break;

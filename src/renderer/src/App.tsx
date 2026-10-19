@@ -51,10 +51,29 @@ export default function App() {
   const [activeSearch, setActiveSearch] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeSearchRef = useRef(false);
-  // Live search preview.
+  // Live search preview (ghost riding the best-so-far path). The preview path
+  // is downsampled: samples are `liveStride` real 240Hz ticks apart, so the
+  // playback clock advances at 240/liveStride indices per second.
   const [livePath, setLivePath] = useState<SearchResult["path"] | null>(null);
+  const [ghostTick, setGhostTick] = useState<number | null>(null);
+  const [liveStride, setLiveStride] = useState(1);
+  // Poll cadence for the live preview in ms. 0 is valid and means "poll as
+  // fast as the event loop allows" (setTimeout(0)) — the server caches the
+  // sim, so a hot loop is cheap and only triggers on a genuine new best.
+  const [livePollDelay, setLivePollDelay] = useState(130);
+  // Mirror of livePollDelay so the self-scheduling poll loop can read the
+  // current value without restarting the effect (changing the input mid-search
+  // takes effect on the next poll).
+  const livePollDelayRef = useRef(130);
+  livePollDelayRef.current = livePollDelay;
+  const liveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // `bestVersion` of the last preview actually applied. IPC structured-clone
+  // re-creates the path array every poll, so the "new best?" signal is the
+  // monotonic `bestVersion` from the main process (unchanged between polls,
+  // +1 on a genuine new best).
+  const appliedBestVersionRef = useRef<number | null>(null);
+  // Replay transport tick (loaded leaderboard replay / saved run).
   const [liveTick, setLiveTick] = useState<number | null>(null);
-  const liveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Extra brute-force controls.
   const [actionTicks, setActionTicks] = useState(4);
   const [maxCandidates, setMaxCandidates] = useState(50_000);
@@ -79,6 +98,8 @@ export default function App() {
   const [replayPath, setReplayPath] = useState<SearchResult["path"] | null>(null);
   const [replayArrow, setReplayArrow] = useState("Narrow Arrow");
   const [replayMeta, setReplayMeta] = useState<{ username?: string; timeS?: number; levelId?: string } | null>(null);
+  /** Arrow for a directly-loaded saved run (separate from the UI's search arrow). */
+  const [loadedArrow, setLoadedArrow] = useState<string | null>(null);
   // Tabs.
   const [activeTab, setActiveTab] = useState<ActiveTab>("search");
 
@@ -92,7 +113,12 @@ export default function App() {
     try {
       setError(null);
       setPath(null);
+      setReplayPath(null);
+      setReplayMeta(null);
+      setLoadedArrow(null);
+      setPlaying(false);
       setAnalysis(null);
+      setGhostTick(null);
       const payload = await window.nf.getLevelData(id);
       setGeometry(payload.geometry);
     } catch (err) {
@@ -126,6 +152,9 @@ export default function App() {
         setProgress({ ...emptyProgress, done: true, error: evt.error });
         setActiveSearch(false);
         activeSearchRef.current = false;
+        setLivePath(null);
+        setGhostTick(null);
+        ghostClockRef.current = { tick: 0, at: 0 };
         return;
       }
       if (evt.done && evt.result) {
@@ -139,8 +168,12 @@ export default function App() {
           done: true,
         });
         setPath(evt.result.path);
+        setLoadedArrow(evt.result.arrowName ?? loadedArrow);
         setActiveSearch(false);
         activeSearchRef.current = false;
+        setLivePath(null);
+        setGhostTick(null);
+        ghostClockRef.current = { tick: 0, at: 0 };
         void refreshRuns();
         return;
       }
@@ -157,66 +190,95 @@ export default function App() {
     return unsub;
   }, [refreshRuns]);
 
-  // Live search preview: poll the active search's best path at ~8 Hz and let
-  // the ghost arrow ride the best-so-far path in real time.
+  // Live search preview: poll the active search's best path and let the ghost
+  // arrow ride the best-so-far path in real time. The server caches the sim and
+  // returns a stable `bestVersion` counter that increments only on a genuine
+  // new best, so we swap the replay (and restart the ghost clock) only when it
+  // changes — never for a heartbeat poll. The delay is user-configurable; 0 is
+  // valid and means "as fast as the event loop allows" (setTimeout(0)), which
+  // is cheap thanks to the cache.
   useEffect(() => {
     if (!activeSearch) {
       if (liveTimerRef.current) {
-        clearInterval(liveTimerRef.current);
+        clearTimeout(liveTimerRef.current);
         liveTimerRef.current = null;
       }
-      setLiveTick(null);
+      setGhostTick(null);
+      setLivePath(null);
+      appliedBestVersionRef.current = null;
+      ghostClockRef.current = { tick: 0, at: 0 };
       return;
     }
-    let lastLen = 0;
-    liveTimerRef.current = setInterval(() => {
+    let cancelled = false;
+    const poll = () => {
       void window.nf
         .getLivePath()
         .then((snap: LivePathSnapshot | null) => {
+          if (cancelled) return;
           if (!snap) return;
-          if (snap.path && snap.path.length > 0) {
-            // New best path may be longer or a completely new route — restart
-            // the ghost if the path changed shape dramatically.
-            if (Math.abs(snap.path.length - lastLen) > snap.path.length * 0.5) {
-              setLiveTick(null);
-              ghostClockRef.current = { tick: 0, at: 0 };
-            }
-            lastLen = snap.path.length;
+          if (snap.stride != null && snap.stride > 0) setLiveStride(snap.stride);
+          if (
+            snap.path &&
+            snap.path.length > 0 &&
+            snap.bestVersion != null &&
+            snap.bestVersion !== appliedBestVersionRef.current
+          ) {
+            // A genuine new best arrived — swap the replay and start the ghost
+            // over so it doesn't jump mid-loop on the new route.
+            appliedBestVersionRef.current = snap.bestVersion;
             setLivePath(snap.path);
+            setGhostTick(null);
+            ghostClockRef.current = { tick: 0, at: 0 };
           }
         })
-        .catch(() => {});
-    }, 130);
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled && activeSearchRef.current) {
+            // Self-schedule so changing the delay takes effect immediately and
+            // 0 is honored ("poll now, immediately re-poll").
+            liveTimerRef.current = setTimeout(poll, livePollDelayRef.current);
+          }
+        });
+    };
+    // Reset preview state for the fresh search (already handled by startSearch,
+    // but keep the poll loop self-contained too).
+    liveTimerRef.current = setTimeout(poll, 0);
     return () => {
-      if (liveTimerRef.current) clearInterval(liveTimerRef.current);
+      cancelled = true;
+      if (liveTimerRef.current) clearTimeout(liveTimerRef.current);
       liveTimerRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- livePollDelay read via ref so changes apply without restarting
   }, [activeSearch]);
 
-  // Ghost playback: advance liveTick at game speed (240 ticks/s) while the
-  // search runs, looping so the arrow keeps riding the best-so-far path.
-  // Uses a ref-based clock so the loop doesn't reset every tick.
+  // Ghost playback: advance ghostTick at game speed (240/s) while the search
+  // runs, looping so the arrow keeps riding the best-so-far path. `livePath` is
+  // downsampled server-side: samples are `liveStride` real ticks apart, so the
+  // index advances at 240/liveStride per second. Uses a ref-based clock so the
+  // loop doesn't reset every tick.
   const ghostClockRef = useRef<{ tick: number; at: number }>({ tick: 0, at: 0 });
   useEffect(() => {
     if (!activeSearch || playing) {
-      ghostClockRef.current = { tick: liveTick ?? 0, at: 0 };
+      ghostClockRef.current = { tick: ghostTick ?? 0, at: 0 };
       return;
     }
     if (!livePath || livePath.length < 2) return;
+    const periodMs = (1000 / 240) * liveStride;
     let frame: number;
     // Reset only when starting a fresh ghost session (new path version).
     if (ghostClockRef.current.at === 0) {
       ghostClockRef.current = { tick: 0, at: Date.now() };
     }
     const step = () => {
-      const elapsedTicks = Math.floor((Date.now() - ghostClockRef.current.at) / (1000 / 240));
+      const elapsedTicks = Math.floor((Date.now() - ghostClockRef.current.at) / periodMs);
       const current = (ghostClockRef.current.tick + elapsedTicks) % Math.max(1, livePath.length);
-      setLiveTick(current);
+      setGhostTick(current);
       frame = requestAnimationFrame(step);
     };
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
-  }, [activeSearch, playing, livePath]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ref clock, see ghostClockRef
+  }, [activeSearch, playing, livePath, liveStride]);
 
   // Playback tick loop.
   useEffect(() => {
@@ -266,10 +328,15 @@ export default function App() {
     setPath(null);
     setAnalysis(null);
     setLivePath(null);
-    setLiveTick(null);
+    setGhostTick(null);
     setReplayPath(null);
     setReplayMeta(null);
+    setLoadedArrow(null);
     setPlaying(false);
+    setPlaybackTick(0);
+    // A completed search should rest its marker at the finish; a non-null tick
+    // would pin the arrow at that index of the new display path.
+    setLiveTick(null);
     setProgress({ ...emptyProgress, message: "Starting search…", done: false });
 
     // Resolve the reference seed: an explicitly learned run wins over the
@@ -278,12 +345,16 @@ export default function App() {
     const refFinishTicks = reference?.finishTick ?? null;
     const refArrow = reference?.arrowName ?? arrow;
     const refCount = reference?.inputCount;
+    // The reference only influences genetic/brute runs. If it exists but this
+    // mode ignores it (beam), search with the UI's arrow rather than a stale
+    // reference arrow the user would have no way to see or change.
+    const usesReference = reference != null && (mode === "genetic" || mode === "brute");
     const params: SearchParams = {
       mode,
       levelId: selectedLevelId,
       // Learning from a run: match the reference's arrow so the seed's physics
       // line up with the search.
-      arrowName: reference?.arrowName ?? arrow,
+      arrowName: usesReference ? reference!.arrowName : arrow,
       budgetSec,
       rngSeed: 1,
       referenceInfluence: influence,
@@ -319,6 +390,8 @@ export default function App() {
     activeSearchRef.current = false;
     setProgress({ ...progress, done: true, message: "Cancelled." });
     setLivePath(null);
+    setGhostTick(null);
+    setPlaying(false);
     setLiveTick(null);
   };
 
@@ -328,6 +401,10 @@ export default function App() {
       setSelectedLevelId(res.levelId);
       setGeometry(res.geometry);
       setPath(null);
+      setReplayPath(null);
+      setReplayMeta(null);
+      setLoadedArrow(null);
+      setPlaying(false);
       setAnalysis(null);
     } catch (err) {
       setError(String(err instanceof Error ? err.message : err));
@@ -391,7 +468,10 @@ export default function App() {
   const openLeaderboardReplay = async (sel: ReplaySelection) => {
     setReplayMeta({ username: sel.username, timeS: sel.timeS, levelId: sel.levelId });
     setReplayArrow(sel.arrowName);
+    setLoadedArrow(sel.arrowName);
     setLivePath(null);
+    setGhostTick(null);
+    setPlaying(false);
     setError(null);
     try {
       const sim = await window.nf.simulateReplay({
@@ -418,14 +498,30 @@ export default function App() {
     setPath(null);
     setReplayPath(null);
     setReplayMeta(null);
+    setLoadedArrow(null);
+    setPlaying(false);
     setAnalysis(null);
+    setGhostTick(null);
     setError(null);
     setActiveTab("search");
   };
 
   const displayPath = replayPath && replayPath.length > 1 ? replayPath : path;
-  const displayArrow = replayPath && replayPath.length > 1 ? replayArrow : arrow;
-  const markerIdx = playing || liveTick != null ? liveTick ?? 0 : null;
+  // Replay > loaded saved run > the UI search arrow.
+  const displayArrow =
+    (replayPath && replayPath.length > 1 ? replayArrow : null) ??
+    (loadedArrow && !replayPath ? loadedArrow : null) ??
+    arrow;
+  // The display-path marker follows the replay transport when a replay/saved
+  // run is shown; during a search it follows the live ghost instead.
+  const hasDisplayPath = !!displayPath && displayPath.length > 1;
+  const markerIdx = hasDisplayPath
+    ? playing || liveTick != null
+      ? liveTick ?? 0
+      : null
+    : ghostTick != null
+      ? ghostTick
+      : null;
 
   return (
     <div
@@ -502,7 +598,11 @@ export default function App() {
               <select
                 style={{ ...selectStyle, maxWidth: "100%" }}
                 value={selectedLevelId}
-                onChange={(e) => void loadLevel(e.target.value)}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  setSelectedLevelId(id);
+                  void loadLevel(id);
+                }}
               >
                 {filteredLevels.map((l) => (
                   <option key={l.id} value={l.id}>
@@ -656,6 +756,20 @@ export default function App() {
               />
             </label>
 
+            <label style={labelStyle}>
+              Live preview refresh (ms)
+              <input
+                style={inputStyle}
+                type="number"
+                min={0}
+                max={10000}
+                step={10}
+                value={livePollDelay}
+                onChange={(e) => setLivePollDelay(Math.max(0, Math.round(Number(e.target.value))))}
+                title="How often to check for a new best-run path (0 = as fast as possible). The replay only changes when a genuine new best arrives."
+              />
+            </label>
+
             <div style={{ display: "flex", gap: 8 }}>
               <button style={primaryButtonStyle} onClick={() => void startSearch()} disabled={activeSearch}>
                 {activeSearch ? "Searching…" : "Run search"}
@@ -712,7 +826,7 @@ export default function App() {
                 arrowName={displayArrow}
                 markerIndex={markerIdx}
                 livePath={livePath}
-                liveTick={playing || liveTick != null ? liveTick : null}
+                liveTick={ghostTick}
                 onPathAnalysis={setAnalysis}
                 width={920}
                 height={640}
@@ -746,7 +860,7 @@ export default function App() {
                   <div style={{ color: "#9d8dff", fontWeight: 700, marginBottom: 2 }}>
                     🔎 LIVE SEARCH · {arrow}
                   </div>
-                  <LiveHud path={livePath} tick={liveTick} />
+                  <LiveHud path={livePath} tick={ghostTick} stride={liveStride} />
                 </div>
               )}
             </>
@@ -800,7 +914,7 @@ export default function App() {
               style={{ flex: 1, accentColor: "#7ad4ff" }}
             />
             <span style={{ color: "#7d8590", whiteSpace: "nowrap" }}>
-              {(((liveTick ?? 0) / 240)).toFixed(2)}s / {(displayPath.length / 240).toFixed(2)}s
+              {(((liveTick ?? playbackTick ?? 0) / 240)).toFixed(2)}s / {(displayPath.length / 240).toFixed(2)}s
             </span>
             <select
               value={playbackSpeed}
@@ -889,9 +1003,11 @@ export default function App() {
                         setReplayPath(null);
                         setReplayMeta(null);
                         setReplayArrow(run.arrowName);
+                        setLoadedArrow(run.arrowName);
                         setAnalysis(null);
                         setPlaybackTick(0);
                         setLiveTick(0);
+                        setGhostTick(null);
                         setPlaying(false);
                       }}
                     >
@@ -911,17 +1027,32 @@ export default function App() {
   );
 }
 
-/** Small live telemetry readout for the ghost arrow riding a search path. */
-function LiveHud({ path, tick }: { path: SearchResult["path"]; tick: number | null }) {
-  const i = tick != null ? Math.min(Math.max(0, Math.round(tick)), Math.max(0, path.length - 1)) : null;
+/**
+ * Live telemetry for the ghost arrow riding a search path. `tick` is a path
+ * index into a path that is downsampled `stride` real 240Hz ticks per sample,
+ * so "real" elapsed ticks = index * stride.
+ */
+function LiveHud({
+  path,
+  tick,
+  stride,
+}: {
+  path: SearchResult["path"];
+  tick: number | null;
+  stride: number;
+}) {
+  const last = Math.max(0, path.length - 1);
+  const i = tick != null ? Math.min(Math.max(0, Math.round(tick)), last) : null;
   const t = i ?? 0;
+  const realTick = t * stride;
+  const realTotal = Math.max(1, path.length - 1) * stride;
   const p = path[t];
   const prev = path[Math.max(0, t - 1)];
   const isCoast = p && (p.input ?? 0) === 0;
   const isBrake = p && (p.input ?? 0) === 3;
   const dx = p && prev ? p.x - prev.x : 0;
   const dy = p && prev ? p.y - prev.y : 0;
-  const speed = Math.hypot(dx, dy) * 240; // px per tick -> px/s
+  const speed = Math.hypot(dx, dy) * (240 / stride); // px per stride tick -> px/s
 
   const inputName =
     p && p.input != null
@@ -938,8 +1069,8 @@ function LiveHud({ path, tick }: { path: SearchResult["path"]; tick: number | nu
     <div>
       <div>
         <span style={{ color: "#7d8590" }}>tick </span>
-        <span style={{ color: "#e6edf3" }}>{(t / 240).toFixed(3)}s</span>
-        <span style={{ color: "#7d8590" }}> / {(path.length / 240).toFixed(2)}s</span>
+        <span style={{ color: "#e6edf3" }}>{(realTick / 240).toFixed(3)}s</span>
+        <span style={{ color: "#7d8590" }}> / {(realTotal / 240).toFixed(2)}s</span>
       </div>
       <div>
         <span style={{ color: "#7d8590" }}>speed </span>

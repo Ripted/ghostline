@@ -60,6 +60,14 @@ export async function bruteSearch(
   let best: FoundRun | null = null;
   let evaluations = 0;
   let nodesExplored = 0;
+  let lastProgress = 0;
+  // Last live-preview best we published (see beam.ts for the rationale — the
+  // live ghost only advances on genuine new bests).
+  let publishedBest: { symbols: number[]; finishTick: number | null; progress: number } | null = null;
+  // During discovery (no finish yet) the furthest *surviving* node is the live
+  // "best". The frontier isn't kept sorted when it stays under the cap, so
+  // track it explicitly.
+  let discoveryBest: { symbols: number[]; progress: number; survivedTicks: number } | null = null;
   const start = Date.now();
   const deadline = o.budgetMs > 0 ? start + o.budgetMs : Infinity;
 
@@ -110,6 +118,10 @@ export async function bruteSearch(
         continue; // don't extend past a finish
       }
       if (out.code === 2) continue; // dead
+      // Track the furthest surviving node for the live discovery preview.
+      if (!discoveryBest || out.progress > discoveryBest.progress) {
+        discoveryBest = { symbols: fullSymbols, progress: out.progress, survivedTicks: out.survivedTicks };
+      }
       nextFrontier.push({ symbols, progress: out.progress, survivedTicks: out.survivedTicks, code: out.code, finishTick: null });
     }
 
@@ -120,15 +132,45 @@ export async function bruteSearch(
     }
     frontier = nextFrontier;
 
-    progress?.({
-      message: `Brute depth ${frontier.length ? prefix.length + frontier[0].symbols.length : "-"}: explored ${nodesExplored} candidates, best ${best ? (best.timeMs / 1000).toFixed(3) + "s" : "not yet"}`,
-      evaluations,
-      generations: 0,
-      rollouts: evaluations,
-      bestTimeMs: best ? best.timeMs : null,
-      bestFinishTick: best ? best.finishTick : null,
-      bestSymbols: best ? best.symbols.slice(0, 4000) : undefined,
-    });
+    // During discovery (no finish yet) the furthest surviving node is the live
+    // "best"; once a finish exists, only a faster finish is a new best.
+    const previewBase = best ?? discoveryBest;
+    let isNewBest = false;
+    if (previewBase) {
+      const full = previewBase.symbols;
+      let finish: number | null;
+      let prog: number;
+      if (best) {
+        finish = best.finishTick;
+        prog = best.progress;
+      } else {
+        finish = null;
+        prog = discoveryBest?.progress ?? 0;
+      }
+      isNewBest =
+        !publishedBest ||
+        (finish != null && (publishedBest.finishTick == null || finish < publishedBest.finishTick)) ||
+        (finish == null && publishedBest.finishTick == null && prog > publishedBest.progress);
+      if (isNewBest) {
+        publishedBest = { symbols: full, finishTick: finish, progress: prog };
+      }
+    }
+
+    // Throttle progress to ~75ms so fast bursts don't flood the IPC event bus;
+    // a new best is always published immediately.
+    const now = Date.now();
+    if (now - lastProgress >= 75 || isNewBest) {
+      lastProgress = now;
+      progress?.({
+        message: `Brute depth ${frontier.length ? prefix.length + frontier[0].symbols.length : "-"}: explored ${nodesExplored} candidates, best ${best ? (best.timeMs / 1000).toFixed(3) + "s" : "not yet"}`,
+        evaluations,
+        generations: 0,
+        rollouts: evaluations,
+        bestTimeMs: best ? best.timeMs : null,
+        bestFinishTick: best ? best.finishTick : null,
+        bestSymbols: isNewBest && publishedBest ? publishedBest.symbols.slice() : undefined,
+      });
+    }
   }
 
   if (!best) {

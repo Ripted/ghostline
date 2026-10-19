@@ -303,16 +303,30 @@ export async function geneticOptimize(
   let bestScore = Number.MAX_SAFE_INTEGER;
   let evaluations = 0;
 
-  // Evaluate the seed.
+  // Evaluate the seed (this is the initial best — publish it once below).
   {
     const out = await evalFlat(bestFlat);
     evaluations++;
     bestScore = out.code === 1 && out.finishTick != null ? out.finishTick : 1e8 - out.progress * 50;
   }
+  const seedPublishedSymbols = bestFlat.slice();
+  progress?.({
+    message: "Genetic: seed evaluated",
+    evaluations,
+    generations: 0,
+    rollouts: evaluations,
+    bestTimeMs: bestScore < 1e6 ? bestScore * TICK_MS : null,
+    bestFinishTick: bestScore < 1e6 ? bestScore : null,
+    bestSymbols: seedPublishedSymbols,
+  });
 
   let population: number[][] = [seedFlat.slice()];
   let generation = 0;
   let improved = false;
+  let lastProgress = 0;
+  // True for the generation that actually beat the previous best (the only one
+  // that should carry a new `bestSymbols` for the live preview).
+  let newBestThisGen = false;
   const start = Date.now();
   const deadline = o.budgetMs > 0 ? start + o.budgetMs : Infinity;
 
@@ -375,6 +389,9 @@ export async function geneticOptimize(
       bestFlat = bestOfGen.flat.slice();
       bestScore = bestOfGen.score;
       improved = true;
+      newBestThisGen = true;
+    } else {
+      newBestThisGen = false;
     }
 
     // Build the next population: elite + mutated bests.
@@ -391,19 +408,24 @@ export async function geneticOptimize(
     }
 
     generation++;
-    progress?.({
-      message: `Genetic gen ${generation}: best ${bestScore < 1e6 ? (bestScore * TICK_MS / 1000).toFixed(3) + "s" : "DNF"}`,
-      evaluations,
-      generations: generation,
-      rollouts: evaluations,
-      bestTimeMs: bestScore < 1e6 ? bestScore * TICK_MS : null,
-      bestFinishTick: bestScore < 1e6 ? bestScore : null,
-      bestSymbols: bestFlat.slice(0, 4000),
-    });
+    const now = Date.now();
+    if (now - lastProgress >= 75 || newBestThisGen) {
+      lastProgress = now;
+      progress?.({
+        message: `Genetic gen ${generation}: best ${bestScore < 1e6 ? (bestScore * TICK_MS / 1000).toFixed(3) + "s" : "DNF"}`,
+        evaluations,
+        generations: generation,
+        rollouts: evaluations,
+        bestTimeMs: bestScore < 1e6 ? bestScore * TICK_MS : null,
+        bestFinishTick: bestScore < 1e6 ? bestScore : null,
+        bestSymbols: newBestThisGen ? bestFlat.slice() : undefined,
+      });
+    }
   }
 
   // 1-tick coordinate-descent polish: nudge each segment boundary by ±1..24
   // tick and keep improvements (the productive final squeeze from tas-brute).
+  const bestScoreBeforePolish = bestScore;
   if (bestScore < 1e6) {
     let polished = true;
     let passes = 0;
@@ -449,6 +471,20 @@ export async function geneticOptimize(
   evaluations++;
   const finishTick = finalEval.code === 1 ? finalEval.finishTick : null;
   const seedFinish = o.seedFinishTick;
+
+  // Polish may have improved the stream without publishing; emit the final
+  // best so the live ghost ends on the true best run (only when it changed).
+  if (bestScore < bestScoreBeforePolish) {
+    progress?.({
+      message: "Genetic: polish complete",
+      evaluations,
+      generations: generation,
+      rollouts: evaluations,
+      bestTimeMs: bestScore < 1e6 ? bestScore * TICK_MS : null,
+      bestFinishTick: bestScore < 1e6 ? bestScore : null,
+      bestSymbols: bestFlat.slice(),
+    });
+  }
 
   return {
     symbols: bestFlat,

@@ -37,12 +37,21 @@ export interface CoordinatorEvents {
 export class Coordinator {
   private pool: SearchPool | null = null;
   private currentBestSymbols: number[] | null = null;
+  /** Bumped every time `bestSymbols` is replaced (a genuine new best). The
+   * renderer's live ghost restarts only when this changes — a cheap signal
+   * that survives IPC structured-clone. */
+  private currentBestVersion = 0;
 
   constructor(private readonly levelData: RawLevelData) {}
 
   /** Latest best symbol stream seen during a run (null before first progress). */
   get bestSymbols(): number[] | null {
     return this.currentBestSymbols;
+  }
+
+  /** Monotonic version of the current best (1 = first best, 0 = none yet). */
+  get bestVersion(): number {
+    return this.currentBestVersion;
   }
 
   async run(params: SearchParams, events: CoordinatorEvents): Promise<SearchResult> {
@@ -63,7 +72,12 @@ export class Coordinator {
     const rngSeed = params.rngSeed ?? 1;
 
     const sink: ProgressSink = (u) => {
-      if (u.bestSymbols) this.currentBestSymbols = u.bestSymbols.slice();
+      if (u.bestSymbols) {
+        // Keep the FULL stream — the live path piggy-backs on the renderer's
+        // nf:getLivePath and downsamples from here, so never truncate.
+        this.currentBestSymbols = u.bestSymbols.slice();
+        this.currentBestVersion++;
+      }
       events.onProgress?.({
         searchId: params.levelId,
         message: u.message,
@@ -76,7 +90,9 @@ export class Coordinator {
         evaluations: u.evaluations,
         generations: u.generations,
         rollouts: u.rollouts,
-        bestSymbols: u.bestSymbols,
+        // The renderer ignores bestSymbols on progress events; keep payloads
+        // small (the live path comes back through nf:getLivePath).
+        bestSymbols: undefined,
       });
     };
 
@@ -163,8 +179,13 @@ export class Coordinator {
       this.pool = null;
     }
 
-    // Rebuild the exact trajectory for playback.
-    const sim = await simulateRunExact(levelJson, arrow, symbols);
+    // Rebuild the exact trajectory for playback. The input stream is capped at
+    // the finishing tick so the replay's tick count matches the recorded time:
+    // a finished flag on a stale path is just a marker in the returned geometry.
+    const sim =
+      finishTick != null && symbols.length > finishTick
+        ? await simulateRunExact(levelJson, arrow, symbols.slice(0, finishTick))
+        : await simulateRunExact(levelJson, arrow, symbols);
     const exactFinish = sim.finishTick ?? finishTick;
 
     const result: SearchResult = {
