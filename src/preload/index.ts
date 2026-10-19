@@ -10,8 +10,15 @@ export type { LevelGeometryPayload };
 /** A live snapshot of the running search's best path. */
 export interface LivePathSnapshot {
   searchId?: string;
-  bestSymbols?: number[];
+  /** Monotonic counter that increments only on a genuine new best — the
+   * renderer restarts its ghost when this changes. */
+  bestVersion?: number;
+  /** Downsampled path (stride apart) — see `stride`. */
   path?: SimPoint[];
+  /** Real tick count of the full simulated run (before downsampling). */
+  tickCount?: number;
+  /** Consecutive path samples are `stride` real 240Hz game ticks apart. */
+  stride?: number;
   finishTick?: number | null;
   mode?: SearchParams["mode"];
   arrowName?: string;

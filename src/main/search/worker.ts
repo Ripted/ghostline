@@ -42,11 +42,16 @@ interface ReadyMessage {
   type: "ready";
 }
 
+interface FatalMessage {
+  type: "fatal";
+  error: string;
+}
+
 const ctx = workerData as WorkerInit;
 
 let engine: Engine | null = null;
 
-function respond(msg: EvalResponse | ReadyMessage) {
+function respond(msg: EvalResponse | ReadyMessage | FatalMessage) {
   parentPort?.postMessage(msg);
 }
 
@@ -54,15 +59,21 @@ async function main() {
   try {
     engine = await Engine.create(ctx.levelData, ctx.arrowName, ctx.levelId);
     if (!engine) throw new Error("engine init failed");
-    respond({ type: "ready" });
   } catch (err) {
-    respond({ type: "ready" }); // worker is not usable; coordinator detects null engine
-    throw err;
+    // Signal the pool that this worker is unusable and exit cleanly so the
+    // pool can keep running the remaining workers.
+    respond({ type: "fatal", error: err instanceof Error ? err.message : String(err) });
+    process.exit(0);
   }
 
+  respond({ type: "ready" });
   parentPort?.on("message", (msg: EvalTask) => {
     if (!msg || msg.type === "shutdown") return;
     const task = msg;
+    if (!engine) {
+      respond({ type: "eval", id: task.id, results: [] });
+      return;
+    }
     const results = task.symbols.map((symbols) => {
       engine!.reset();
       const { code, finishTick, lastPoint, survivedTicks } = engine!.rollout(symbols);

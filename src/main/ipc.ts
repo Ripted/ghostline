@@ -34,11 +34,50 @@ import { levelGeometry } from "../shared/geometry.ts";
 interface ActiveSearch {
   coordinator: Coordinator;
   params: SearchParams;
+  /** Bumped on every start/cancel so late events from a stale run are ignored. */
+  generation: number;
 }
 
+/** A capped live-path preview for the renderer's ghost (transmitted data). */
+interface LivePathPayload {
+  searchId?: string;
+  /** Monotonic "which best is this" counter — increments only on a genuine
+   * new best. The renderer restarts its ghost when this changes (IPC
+   * structured-clone makes reference equality useless across polls). */
+  bestVersion?: number;
+  /** Downsampled path (equal-stride picks, last point preserved). */
+  path?: unknown[];
+  /** Real tick count of the full simulated run (before downsampling). */
+  tickCount?: number;
+  /** Path points are `stride` real ticks apart; ghost advances at 240/stride idx/s. */
+  stride?: number;
+  finishTick?: number | null;
+  mode?: string;
+  arrowName?: string;
+}
+
+const LIVE_PATH_MAX_POINTS = 2000;
+
 let activeSearch: ActiveSearch | null = null;
+let searchGeneration = 0;
 /** Cache the level data for the active search (needed for live path sims). */
 let activeLevelData: RawLevelData | null = null;
+/** Live-path sim cache keyed by the best VERSION — re-sims only when the
+ * optimizer publishes a genuine new best (not every poll). */
+let livePathCache: { version?: number; payload?: LivePathPayload } = {};
+
+/** Downsample a full per-tick path to <= maxPoints, keeping the endpoints. */
+function downsamplePath<T>(path: T[], maxPoints: number): { points: T[]; stride: number } {
+  if (path.length <= maxPoints) return { points: path, stride: 1 };
+  const stride = Math.ceil(path.length / maxPoints);
+  const points: T[] = [];
+  for (let i = 0; i < path.length; i += stride) points.push(path[i]);
+  // Always keep the final sample so the ghost reaches the true end of the run.
+  if (points.length === 0 || points[points.length - 1] !== path[path.length - 1]) {
+    points.push(path[path.length - 1]);
+  }
+  return { points, stride };
+}
 
 /** Send a progress update to the renderer. */
 function emitProgress(payload: unknown) {
@@ -180,7 +219,9 @@ export function registerIpc() {
     }
 
     const coordinator = new Coordinator(data);
-    activeSearch = { coordinator, params };
+    const generation = ++searchGeneration;
+    livePathCache = {};
+    activeSearch = { coordinator, params, generation };
     activeLevelData = data;
 
     // Run the search without holding up the invoke; resolve immediately with a
@@ -188,58 +229,98 @@ export function registerIpc() {
     const searchId = params.levelId + ":" + Date.now();
     void coordinator
       .run(params, {
-        onProgress: (p) => emitProgress({ ...p, searchId }),
+        onProgress: (p) => {
+          if (activeSearch?.generation !== generation) return; // stale run
+          emitProgress({ ...p, searchId });
+        },
         onResult: (r) => {
+          if (activeSearch?.generation !== generation) return;
           saveRun(r);
-          emitProgress({ ...r, done: true, searchId });
-          activeSearch = null;
-          activeLevelData = null;
+          // The renderer's handler keys off `result` — include both the flat
+          // result fields (for any progress UI) and the full result object.
+          emitProgress({ ...r, done: true, result: r, searchId });
+          if (activeSearch?.generation === generation) {
+            activeSearch = null;
+            activeLevelData = null;
+          }
         },
         onError: (err) => {
+          if (activeSearch?.generation !== generation) return;
           emitProgress({ error: String(err?.message ?? err), done: true, searchId });
-          activeSearch = null;
-          activeLevelData = null;
+          if (activeSearch?.generation === generation) {
+            activeSearch = null;
+            activeLevelData = null;
+          }
         },
       })
       .catch((err) => {
+        if (activeSearch?.generation !== generation) return;
         emitProgress({ error: String(err?.message ?? err), done: true, searchId });
-        activeSearch = null;
-        activeLevelData = null;
+        if (activeSearch?.generation === generation) {
+          activeSearch = null;
+          activeLevelData = null;
+        }
       });
 
     return { searchId };
   });
 
   ipcMain.handle("nf:cancelSearch", () => {
-    activeSearch?.coordinator.stop();
-    activeSearch = null;
-    activeLevelData = null;
+    const current = activeSearch;
+    if (current) {
+      searchGeneration++; // invalidate any in-flight events from this run
+      livePathCache = {};
+      current.coordinator.stop();
+      if (activeSearch === current) {
+        activeSearch = null;
+        activeLevelData = null;
+      }
+    }
     return true;
   });
 
-  ipcMain.handle("nf:getLivePath", async (): Promise<unknown | null> => {
+  ipcMain.handle("nf:getLivePath", async (): Promise<LivePathPayload | null> => {
     const search = activeSearch;
     if (!search || !activeLevelData) return null;
+    const bestVersion = search.coordinator.bestVersion;
     const bestSymbols = search.coordinator.bestSymbols;
     if (!bestSymbols || bestSymbols.length === 0) {
-      return { searchId: search.params.levelId, bestSymbols: [], path: [] as unknown[], done: false };
+      livePathCache = {};
+      return {
+        searchId: search.params.levelId,
+        bestVersion,
+        path: [],
+        tickCount: 0,
+        stride: 1,
+        finishTick: null,
+        mode: search.params.mode,
+        arrowName: search.params.arrowName,
+      };
     }
-    // Downsample for cheap live preview (cap 2000 pts, stride ~8).
-    const stride = Math.max(1, Math.floor(bestSymbols.length / 2000));
-    let sampled: number[] = bestSymbols;
-    if (stride > 1) {
-      sampled = [];
-      for (let i = 0; i < bestSymbols.length; i += stride) sampled.push(bestSymbols[i]);
+    // Re-sim only when the optimum actually changed (the coordinator bumps its
+    // best version on each genuine new best) — otherwise the poll would re-run
+    // a blocking WASM sim every interval.
+    if (livePathCache.version === bestVersion && livePathCache.payload) {
+      return livePathCache.payload;
     }
-    const sim = await simulateRunExact(activeLevelData, search.params.arrowName, sampled);
-    return {
+    // Always simulate the FULL symbol stream: sampling symbols by stride would
+    // change the physics (the engine is driven tick-by-tick), so the preview
+    // would diverge from the run's real trajectory. Downsampling *after* the
+    // sim only thins the rendered polyline.
+    const sim = await simulateRunExact(activeLevelData, search.params.arrowName, bestSymbols);
+    const { points, stride } = downsamplePath(sim.path, LIVE_PATH_MAX_POINTS);
+    const payload: LivePathPayload = {
       searchId: search.params.levelId,
-      bestSymbols,
-      path: sim.path,
+      bestVersion,
+      path: points,
+      tickCount: sim.path.length,
+      stride,
       finishTick: sim.finishTick,
       mode: search.params.mode,
       arrowName: search.params.arrowName,
     };
+    livePathCache = { version: bestVersion, payload };
+    return payload;
   });
 
   ipcMain.handle(
